@@ -1,6 +1,6 @@
 # Birds Around Me
 
-**Telegram-бот для отслеживания птиц рядом с вами**  
+**Бот для отслеживания птиц рядом с вами https://t.me/birdsaroundmebot**  
 Работает на данных **iNaturalist.org**. Показывает, кто летает вокруг, уведомляет о редких видах и птицах из вишлиста.
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org)
