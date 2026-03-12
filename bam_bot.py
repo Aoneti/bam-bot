@@ -25,7 +25,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ================= ЛОГИРОВАНИЕ =================
 logging.basicConfig(
@@ -331,26 +330,53 @@ def days_since(dt_str: str | None) -> int | None:
         return None
 
 # ================= БАЗОВЫЙ API-ЗАПРОС С RETRY И СЕМАФОРОМ =================
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-    reraise=True,
-)
 async def _raw_api_get(url: str, params: dict) -> dict:
-    # Семафор ограничивает одновременные запросы к iNaturalist (не более API_SEMAPHORE_LIMIT)
-    async with _api_semaphore:
-        async with http_session.get(url, params=params,
-                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-            r.raise_for_status()
-            return await r.json()
+    """Выполняет запрос к iNaturalist с экспоненциальным backoff и поддержкой Retry-After.
+    При 429 читает заголовок Retry-After и ждёт указанное время.
+    При сетевых ошибках повторяет до 4 раз с нарастающей паузой.
+    """
+    max_retries = 4
+    backoff     = 1.0
+    for attempt in range(max_retries):
+        async with _api_semaphore:
+            try:
+                async with http_session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=12)
+                ) as r:
+                    # 1B: логируем заголовки лимитов для диагностики
+                    remaining = r.headers.get("X-RateLimit-Remaining")
+                    limit     = r.headers.get("X-RateLimit-Limit")
+                    if remaining is not None:
+                        logger.debug(f"iNat rate limit: {remaining}/{limit} remaining [{url}]")
+
+                    if r.status == 429:
+                        ra   = r.headers.get("Retry-After", "")
+                        wait = float(ra) if ra.isdigit() else backoff
+                        logger.warning(
+                            f"429 от iNaturalist {url} — жду {wait}s (попытка {attempt + 1})"
+                        )
+                        await asyncio.sleep(wait)
+                        backoff *= 2
+                        continue
+
+                    r.raise_for_status()
+                    return await r.json()
+
+            except (aiohttp.ClientResponseError, aiohttp.ClientConnectorError,
+                    asyncio.TimeoutError) as e:
+                logger.warning(f"API transient error [{url}] попытка {attempt + 1}: {e}")
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+            except Exception as e:
+                logger.exception(f"Неожиданная ошибка при запросе [{url}]: {e}")
+                break
+
+    logger.error(f"API запрос окончательно не удался [{url}] после {max_retries} попыток")
+    return {}
 
 async def api_get(url: str, params: dict) -> dict:
-    try:
-        return await _raw_api_get(url, params)
-    except Exception as e:
-        logger.error(f"API request failed [{url}]: {e}")
-        return {}
+    return await _raw_api_get(url, params)
 
 # ================= API iNATURALIST =================
 async def get_species_counts(lat, lon, radius, days, page=1):
@@ -1234,7 +1260,8 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         await bot.send_message(telegram_id, "✅ Пока нет редких птиц в вашем радиусе.")
 
 # ================= ПРОВЕРКА ВИШЛИСТА =================
-async def check_watchlist_for_user(telegram_id: int):
+async def check_watchlist_for_user(telegram_id: int,
+                                    observations: list | None = None):
     row  = await db_fetch_one(
         "SELECT lat, lon, radius, period_days FROM users WHERE telegram_id = ?", (telegram_id,)
     )
@@ -1246,8 +1273,24 @@ async def check_watchlist_for_user(telegram_id: int):
         return
 
     lat, lon, radius, days = row
-    taxon_ids  = [f[0] for f in favs]
-    latest_map = await get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids)
+    taxon_ids = [f[0] for f in favs]
+
+    if observations:
+        # Сначала пробуем взять данные из уже загруженного списка наблюдений —
+        # без лишнего API-запроса. Берём самое свежее наблюдение по каждому taxon_id.
+        latest_map: dict = {}
+        watched_set = set(taxon_ids)
+        for obs in observations:
+            tid = obs["taxon"]["id"]
+            if tid in watched_set and tid not in latest_map:
+                latest_map[tid] = obs
+        # Для видов, которых нет в общем списке — запрашиваем отдельно
+        missing = [tid for tid in taxon_ids if tid not in latest_map]
+        if missing:
+            extra = await get_batch_watchlist_observations(lat, lon, radius, days, missing)
+            latest_map.update(extra)
+    else:
+        latest_map = await get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids)
     now_str    = datetime.now(timezone.utc).isoformat()
 
     for taxon_id, taxon_name, last_notified_at in favs:
@@ -1367,7 +1410,7 @@ async def _run_checks_for_user(uid: int, lat: float, lon: float, radius: int, da
         await asyncio.gather(
             check_rare_for_user(uid, manual=False, observations=observations),
             check_bird_alert_for_user(uid, lat, lon, radius, days, observations=observations),
-            check_watchlist_for_user(uid),
+            check_watchlist_for_user(uid, observations=observations),
             return_exceptions=True,
         )
     except Exception:
@@ -1445,7 +1488,10 @@ async def main():
     await db_conn.execute("PRAGMA synchronous=NORMAL")
     db_conn.row_factory = aiosqlite.Row
 
-    http_session   = aiohttp.ClientSession()
+    # TCPConnector согласует число сокетов с семафором — меньше contention
+    http_session   = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=API_SEMAPHORE_LIMIT)
+    )
     _api_semaphore = asyncio.Semaphore(API_SEMAPHORE_LIMIT)
 
     bot_info     = await bot.get_me()
