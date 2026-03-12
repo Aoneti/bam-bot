@@ -636,7 +636,7 @@ async def help_cmd(message: Message):
         "📍 Геолокация — передать координаты\n"
         "⚙️ Настройки — радиус, период, уведомления\n\n"
         "<b>Использовать бота в чатах:</b>\n"
-        "Введите <code>@birdsaroundmebot скворец</code> (или другой вид) в любом чате.\n\n"
+        "Введите <code>@birdsaroundmebot скворец</code> (или другой вид) в любом чате. Но перед этим добавьте бота в чат!\n\n"
         "<b>Команды:</b>\n"
         "/cancel — выйти из режима ввода",
         parse_mode="HTML",
@@ -700,7 +700,7 @@ async def scan(message: Message):
     uid = message.from_user.id
     now = time()
     if now - _scan_cooldown.get(uid, 0) < SCAN_COOLDOWN_SEC:
-        return await message.answer("⏳ Подождите немного перед следующим сканированием.")
+        return await message.answer("⏳ Подожди немного перед следующим сканированием.")
     _scan_cooldown[uid] = now
 
     wait_msg = await message.answer("🔍 Ищу птиц рядом...")
@@ -834,17 +834,17 @@ async def show_bird(callback: CallbackQuery):
     fav_text = "❌ Убрать из вишлиста" if in_fav else "⭐ В вишлист"
     fav_data = f"fav_remove:{taxon_id}" if in_fav else f"fav_add:{taxon_id}"
 
-    text = (
-        f"🐦 <b>{name}</b>  <i>{sci}</i>\n\n"
-        f"{rare_emoji} {rare_label.capitalize()}\n"
+    text = f"🐦 <b>{name}</b>  <i>{sci}</i>\n"
+    if taxonomy_str:
+        text += taxonomy_str
+    text += (
+        f"\n{rare_emoji} {rare_label.capitalize()}\n"
         f"{dist_str}"
         f"🕒 {ago}\n"
     )
-    if taxonomy_str:
-        text += taxonomy_str
     if season_text:
         text += f"{season_text}\n"
-    text += "\nСамое свежее наблюдение в вашем радиусе."
+    text += "\nСамое свежее наблюдение в твоём радиусе."
 
     kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=obs_url)]]
     if photo_original:
@@ -871,13 +871,13 @@ async def show_wishlist(message: Message):
     )
     if not favs:
         await message.answer(
-            "⭐ Вишлист пуст.\n\n"
+            "⭐ Твой вишлист пуст.\n\n"
             "Откройте карточку птицы и нажмите «⭐ В вишлист» — "
             "бот будет уведомлять вас, когда она появится рядом!"
         )
         return
 
-    text    = "⭐ <b>Ваш вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
+    text    = "⭐ <b>Твой вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
     kb_rows = []
     for tid, name in favs:
         text += f"• {name}\n"
@@ -997,7 +997,7 @@ def _build_settings_content(r: int, d: int, alerts: int) -> tuple[str, InlineKey
         [InlineKeyboardButton(text=_r(25), callback_data="set_r:25"),
          InlineKeyboardButton(text=_r(50), callback_data="set_r:50")],
         [InlineKeyboardButton(text="✏️ Свой радиус", callback_data="set_r:custom")],
-        [InlineKeyboardButton(text="🕒 Период",    callback_data="noop")],
+        [InlineKeyboardButton(text="🕗 Период",    callback_data="noop")],
         [InlineKeyboardButton(text=_d(1,  "24 ч"),    callback_data="set_d:1"),
          InlineKeyboardButton(text=_d(3,  "3 дня"),   callback_data="set_d:3")],
         [InlineKeyboardButton(text=_d(7,  "7 дней"),  callback_data="set_d:7"),
