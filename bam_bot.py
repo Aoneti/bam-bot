@@ -217,6 +217,16 @@ async def init_db():
                 PRIMARY KEY (telegram_id, taxon_id)
             )
         """)
+        # Cooldown-таблица для уведомлений о редких птицах.
+        # Не даёт слать одно и то же чаще раза в 24 часа.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rare_notifications (
+                telegram_id  INTEGER,
+                taxon_id     INTEGER,
+                notified_at  TEXT,
+                PRIMARY KEY (telegram_id, taxon_id)
+            )
+        """)
         for migration in [
             "ALTER TABLE users     ADD COLUMN notify_hours TEXT DEFAULT 'all'",
             "ALTER TABLE favorites ADD COLUMN last_notified_at TEXT",
@@ -626,7 +636,7 @@ async def help_cmd(message: Message):
         "📍 Геолокация — передать координаты\n"
         "⚙️ Настройки — радиус, период, уведомления\n\n"
         "<b>Использовать бота в чатах:</b>\n"
-        "Введите <code>@birdsaroundmebot скворец</code> (или другой вид) в любом чате. Но перед этим добавьте бота в чат!\n\n"
+        "Введите <code>@birdsaroundmebot скворец</code> (или другой вид) в любом чате.\n\n"
         "<b>Команды:</b>\n"
         "/cancel — выйти из режима ввода",
         parse_mode="HTML",
@@ -690,7 +700,7 @@ async def scan(message: Message):
     uid = message.from_user.id
     now = time()
     if now - _scan_cooldown.get(uid, 0) < SCAN_COOLDOWN_SEC:
-        return await message.answer("⏳ Подожди немного перед следующим сканированием.")
+        return await message.answer("⏳ Подождите немного перед следующим сканированием.")
     _scan_cooldown[uid] = now
 
     wait_msg = await message.answer("🔍 Ищу птиц рядом...")
@@ -834,7 +844,7 @@ async def show_bird(callback: CallbackQuery):
         text += taxonomy_str
     if season_text:
         text += f"{season_text}\n"
-    text += "\nСамое свежее наблюдение в твоём радиусе."
+    text += "\nСамое свежее наблюдение в вашем радиусе."
 
     kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=obs_url)]]
     if photo_original:
@@ -861,13 +871,13 @@ async def show_wishlist(message: Message):
     )
     if not favs:
         await message.answer(
-            "⭐ Твой вишлист пуст.\n\n"
+            "⭐ Вишлист пуст.\n\n"
             "Откройте карточку птицы и нажмите «⭐ В вишлист» — "
             "бот будет уведомлять вас, когда она появится рядом!"
         )
         return
 
-    text    = "⭐ <b>Твой вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
+    text    = "⭐ <b>Ваш вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
     kb_rows = []
     for tid, name in favs:
         text += f"• {name}\n"
@@ -987,7 +997,7 @@ def _build_settings_content(r: int, d: int, alerts: int) -> tuple[str, InlineKey
         [InlineKeyboardButton(text=_r(25), callback_data="set_r:25"),
          InlineKeyboardButton(text=_r(50), callback_data="set_r:50")],
         [InlineKeyboardButton(text="✏️ Свой радиус", callback_data="set_r:custom")],
-        [InlineKeyboardButton(text="🕗 Период",    callback_data="noop")],
+        [InlineKeyboardButton(text="🕒 Период",    callback_data="noop")],
         [InlineKeyboardButton(text=_d(1,  "24 ч"),    callback_data="set_d:1"),
          InlineKeyboardButton(text=_d(3,  "3 дня"),   callback_data="set_d:3")],
         [InlineKeyboardButton(text=_d(7,  "7 дней"),  callback_data="set_d:7"),
@@ -1101,41 +1111,105 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
 
     lat, lon, radius, days = row
 
-    if observations is None:
-        observations = await get_recent_observations(lat, lon, radius, days)
+    # При ручном запросе — полный период пользователя (из общего кэша).
+    # При авто-уведомлении — только последние 3 часа, чтобы не повторять одно и то же каждый час.
+    if manual:
+        if observations is None:
+            observations = await get_recent_observations(lat, lon, radius, days)
+    else:
+        d1_str = (datetime.now(timezone.utc) - timedelta(hours=3)).date().isoformat()
+        data   = await api_get(f"{API_BASE}/observations", {
+            "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1_str,
+            "iconic_taxa": "Aves", "locale": "ru",
+            "per_page": 100, "order_by": "observed_on", "order": "desc",
+        })
+        observations = data.get("results", [])
+
+    if not observations:
+        if manual:
+            await bot.send_message(telegram_id, "✅ Пока нет редких птиц в твоём радиусе.")
+        return
+
+    # Cooldown: какие виды уже получали уведомление за последние 24 часа
+    recent_notified: set[int] = set()
+    if not manual:
+        rows = await db_fetch_all(
+            "SELECT taxon_id FROM rare_notifications "
+            "WHERE telegram_id = ? AND notified_at > datetime('now', '-24 hours')",
+            (telegram_id,),
+        )
+        recent_notified = {r[0] for r in rows}
 
     taxon_count: dict[int, list] = defaultdict(list)
     for obs in observations:
         taxon_count[obs["taxon"]["id"]].append(obs)
 
-    found_any = False
+    found_any  = False
+    sent_count = 0
+    now_str    = datetime.now(timezone.utc).isoformat()
+
     for tid, bird_obs in taxon_count.items():
-        if len(bird_obs) == 1:
-            obs = bird_obs[0]
-            obs_lat, obs_lon = _parse_obs_coords(obs)
-            if obs_lat is None:
-                continue
-            dist = haversine(lat, lon, obs_lat, obs_lon)
-            if dist > radius:
+        # Лимит 3 авто-уведомления за один запуск планировщика
+        if not manual and sent_count >= 3:
+            break
+
+        if len(bird_obs) != 1:
+            continue
+
+        obs = bird_obs[0]
+        obs_lat, obs_lon = _parse_obs_coords(obs)
+        if obs_lat is None:
+            continue
+        dist = haversine(lat, lon, obs_lat, obs_lon)
+        if dist > radius:
+            continue
+
+        # Фильтр редкости: только охраняемые виды CR/EN/VU.
+        # Исключает зеленушек и других обычных птиц с единственным локальным наблюдением.
+        if not manual:
+            taxon_data = _get_taxon_cached(tid)
+            if taxon_data and taxon_data.get("results"):
+                cs     = (taxon_data["results"][0].get("conservation_status") or {})
+                status = cs.get("status", "").lower()
+                if status not in ("cr", "en", "vu"):
+                    continue
+            else:
+                # Нет данных в кэше — пропускаем, не делаем лишний API-запрос
                 continue
 
-            found_any = True
-            name  = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
-            ago   = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
-            photo = obs["photos"][0]["url"].replace("square", "medium") if obs.get("photos") else None
-            url   = f"https://www.inaturalist.org/observations/{obs['id']}"
-            text  = (
-                f"🚨 <b>Редкое наблюдение рядом!</b>\n\n"
-                f"<b>{name}</b>\n📍 {dist} км от вас\n🕒 {ago}"
-            )
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
-            ]])
-            if photo:
-                await bot.send_photo(telegram_id, photo, caption=text,
-                                     reply_markup=kb, parse_mode="HTML")
-            else:
-                await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
+            # Cooldown: не слать повторно раньше 24 часов
+            if tid in recent_notified:
+                continue
+
+        found_any = True
+        name  = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
+        ago   = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
+        photo = obs["photos"][0]["url"].replace("square", "medium") if obs.get("photos") else None
+        url   = f"https://www.inaturalist.org/observations/{obs['id']}"
+        text  = (
+            f"🚨 <b>Редкое наблюдение рядом!</b>\n\n"
+            f"<b>{name}</b>\n📍 {dist} км от вас\n🕒 {ago}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
+        ]])
+        if photo:
+            await bot.send_photo(telegram_id, photo, caption=text,
+                                 reply_markup=kb, parse_mode="HTML")
+        else:
+            await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
+
+        if not manual:
+            sent_count += 1
+            try:
+                await db_conn.execute(
+                    "INSERT OR REPLACE INTO rare_notifications "
+                    "(telegram_id, taxon_id, notified_at) VALUES (?, ?, ?)",
+                    (telegram_id, tid, now_str),
+                )
+                await db_conn.commit()
+            except Exception:
+                logger.error(f"Ошибка записи rare_notifications для user {telegram_id}", exc_info=True)
 
     if manual and not found_any:
         await bot.send_message(telegram_id, "✅ Пока нет редких птиц в твоём радиусе.")
