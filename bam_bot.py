@@ -756,7 +756,7 @@ async def handle_city_input(message: Message, state: FSMContext):
         await message.answer(
             "❌ Не удалось найти город.\n"
             "Попробуйте точнее (например «Ярославль, Россия») или /cancel\n\n"
-            "Также можно отправить геолокацию кнопкой 📍 внизу."
+            "Также можно отправить геолокацию кнопкой 📍."
         )
         return
     await db_exec(
@@ -966,7 +966,7 @@ async def show_wishlist(message: Message):
         )
         return
 
-    text    = "⭐ <b>Твой вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
+    text    = "⭐ <b>Вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
     kb_rows = []
     for tid, name in favs:
         text += f"• {name}\n"
