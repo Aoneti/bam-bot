@@ -43,25 +43,31 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 if not TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана!")
 
-API_BASE = "https://api.inaturalist.org/v1"
-DB_NAME  = "bam_users.db"
+EBIRD_API_KEY = os.environ.get("EBIRD_API_KEY", "")  # необязательный, но желательный
 
-BIRD_ALERT_DAYS     = 90    # дней без наблюдений → «давно не появлялась»
-SCAN_CACHE_TTL      = 240   # секунд — кэш страниц сканирования
-OBS_CACHE_TTL       = 900   # секунд (15 мин) — общий кэш наблюдений по координатам
-TAXON_CACHE_TTL     = 6 * 3600   # 6 часов — данные таксона
-HIST_CACHE_TTL      = 24 * 3600  # 24 часа — гистограмма сезонности
+API_BASE    = "https://api.inaturalist.org/v1"
+EBIRD_BASE  = "https://api.ebird.org/v2"
+DB_NAME     = "bam_users.db"
+
+BIRD_ALERT_DAYS       = 90
+SCAN_CACHE_TTL        = 240
+OBS_CACHE_TTL         = 900
+TAXON_CACHE_TTL       = 6 * 3600
+HIST_CACHE_TTL        = 24 * 3600
+HOTSPOT_CACHE_TTL     = 3600        # 1 час
+EBIRD_NOTABLE_TTL     = 1800        # 30 минут
 SCHEDULER_BATCH_SIZE  = 20
-SCHEDULER_BATCH_DELAY = 0.5   # секунды между пачками в планировщике
-SCAN_COOLDOWN_SEC     = 30    # кулдаун кнопки «Сканировать»
-GEOCODE_COOLDOWN_SEC  = 5     # кулдаун запросов к Nominatim на пользователя
-API_SEMAPHORE_LIMIT   = 5     # макс. одновременных запросов к iNaturalist
-AUTO_CHECK_WINDOW_HOURS = 3   # окно фильтрации наблюдений для авто-уведомлений
+SCHEDULER_BATCH_DELAY = 0.5
+SCAN_COOLDOWN_SEC     = 30
+GEOCODE_COOLDOWN_SEC  = 5
+API_SEMAPHORE_LIMIT   = 5
+AUTO_CHECK_WINDOW_HOURS = 3
 
-# Пороги логики редкости
-RARITY_GLOBAL_COMMON_THRESHOLD   = 10_000
-RARITY_LOCAL_RARE_THRESHOLD       = 5
-RARITY_LOCAL_UNCOMMON_THRESHOLD   = 20
+RARITY_GLOBAL_COMMON_THRESHOLD  = 10_000
+RARITY_LOCAL_RARE_THRESHOLD     = 5
+RARITY_LOCAL_UNCOMMON_THRESHOLD = 20
+
+CURRENT_MONTH = datetime.now(timezone.utc).month
 
 bot     = Bot(token=TOKEN)
 storage = MemoryStorage()
@@ -70,34 +76,33 @@ router  = Router()
 dp.include_router(router)
 
 BOT_USERNAME: str          = ""
-_api_semaphore: asyncio.Semaphore = None  # инициализируется в main()
+_api_semaphore: asyncio.Semaphore = None
 
-# ================= FSM СОСТОЯНИЯ =================
+# ================= FSM =================
 class Form(StatesGroup):
     waiting_city          = State()
     waiting_custom_radius = State()
 
 # ================= RATE LIMIT =================
 _scan_cooldown:    dict[int, float]   = {}
-_fav_cooldown:     dict[tuple, float] = {}  # (uid, taxon_id) → timestamp
-_geocode_cooldown: dict[int, float]   = {}  # uid → timestamp
+_fav_cooldown:     dict[tuple, float] = {}
+_geocode_cooldown: dict[int, float]   = {}
 
-# ================= КЭШ СЧЁТЧИКА ВИШЛИСТА =================
+# ================= КЭШ ВИШЛИСТА =================
 _fav_count_cache: dict[int, int] = {}
 
 def _invalidate_fav_count(user_id: int):
     _fav_count_cache.pop(user_id, None)
 
-# ================= ГЛОБАЛЬНЫЕ ОБЪЕКТЫ =================
+# ================= ГЛОБАЛЬНЫЕ =================
 http_session: aiohttp.ClientSession = None
 db_conn:      aiosqlite.Connection  = None
 
 # ================= LRU-КЭШ =================
 class LRUCache:
-    """Простой LRU-кэш с максимальным числом записей."""
     def __init__(self, max_size: int = 200):
         self._cache: OrderedDict = OrderedDict()
-        self._max   = max_size
+        self._max = max_size
 
     def get(self, key):
         if key in self._cache:
@@ -114,11 +119,12 @@ class LRUCache:
 
 _geocode_cache     = LRUCache(max_size=200)
 _taxa_search_cache = LRUCache(max_size=100)
-# Кэши таксонов и гистограмм — LRU с ограничением размера (нет утечки памяти)
-_taxon_cache_lru = LRUCache(max_size=500)
-_hist_cache_lru  = LRUCache(max_size=500)
+_taxon_cache_lru   = LRUCache(max_size=500)
+_hist_cache_lru    = LRUCache(max_size=500)
+_hotspot_cache     = LRUCache(max_size=200)
+_ebird_notable_cache = LRUCache(max_size=200)
 
-# ================= КЭШ СТРАНИЦ СКАНИРОВАНИЯ (по user_id) =================
+# ================= КЭШ СКАНИРОВАНИЯ =================
 _scan_cache:       LRUCache             = LRUCache(max_size=1000)
 _scan_total_pages: dict[int, dict[int, int]] = {}
 
@@ -142,9 +148,7 @@ def _invalidate_scan_cache(user_id: int):
         del _scan_cache._cache[k]
     _scan_total_pages.pop(user_id, None)
 
-# ================= ОБЩИЙ КЭШ НАБЛЮДЕНИЙ ПО КООРДИНАТАМ =================
-# Ключ: (lat_rounded, lon_rounded, radius, days) — round(,2) даёт точность ~1 км.
-# Все пользователи из одного района получают один ответ из кэша.
+# ================= ОБЩИЙ КЭШ НАБЛЮДЕНИЙ =================
 _obs_cache: LRUCache = LRUCache(max_size=500)
 
 def _coord_key(lat: float, lon: float, radius: int, days: int) -> tuple:
@@ -180,7 +184,7 @@ def _get_hist_cached(taxon_id: int, lat: float, lon: float, radius: int):
 def _set_hist_cache(taxon_id: int, lat: float, lon: float, radius: int, data: dict):
     _hist_cache_lru.set((taxon_id, round(lat, 2), round(lon, 2), radius), (time(), data))
 
-# ================= ОЧИСТКА ПАМЯТИ =================
+# ================= ОЧИСТКА =================
 def _cleanup_scan_cache():
     now   = time()
     stale = [k for k, v in _scan_cache._cache.items()
@@ -200,7 +204,6 @@ def _cleanup_cooldowns():
         del _fav_cooldown[k]
 
 async def _cleanup_rare_notifications():
-    """Удаляем записи rare_notifications старше 48 часов — они уже не нужны."""
     try:
         await db_conn.execute(
             "DELETE FROM rare_notifications WHERE notified_at < datetime('now', '-48 hours')"
@@ -220,7 +223,8 @@ async def init_db():
                 lon            REAL,
                 radius         INTEGER DEFAULT 10,
                 period_days    INTEGER DEFAULT 7,
-                alerts_enabled INTEGER DEFAULT 1
+                alerts_enabled INTEGER DEFAULT 1,
+                season_filter  INTEGER DEFAULT 0
             )
         """)
         await db.execute("""
@@ -240,8 +244,6 @@ async def init_db():
                 PRIMARY KEY (telegram_id, taxon_id)
             )
         """)
-        # Cooldown-таблица для уведомлений о редких птицах.
-        # Не даёт слать одно и то же чаще раза в 24 часа.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rare_notifications (
                 telegram_id  INTEGER,
@@ -250,8 +252,10 @@ async def init_db():
                 PRIMARY KEY (telegram_id, taxon_id)
             )
         """)
+        # Миграции — не падаем если колонка уже есть
         for migration in [
             "ALTER TABLE favorites ADD COLUMN last_notified_at TEXT",
+            "ALTER TABLE users ADD COLUMN season_filter INTEGER DEFAULT 0",
         ]:
             try:
                 await db.execute(migration)
@@ -262,7 +266,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_history      ON species_history(telegram_id)")
         await db.commit()
 
-# ================= HELPERS ДЛЯ БД =================
+# ================= DB HELPERS =================
 async def db_fetch_one(sql: str, params: tuple = ()):
     async with db_conn.execute(sql, params) as cur:
         return await cur.fetchone()
@@ -298,8 +302,8 @@ async def geocode_city(query: str):
                 result = (float(res["lat"]), float(res["lon"]), res.get("display_name", query))
                 _geocode_cache.set(key, result)
                 return result
-    except Exception as e:
-        logger.error(f"Geocoding error: {e}")
+    except Exception as ex:
+        logger.error(f"Geocoding error: {ex}")
     return None, None, None
 
 async def reverse_geocode(lat: float, lon: float) -> str:
@@ -353,12 +357,15 @@ def days_since(dt_str: str | None) -> int | None:
     except Exception:
         return None
 
-# ================= БАЗОВЫЙ API-ЗАПРОС С RETRY И СЕМАФОРОМ =================
+def current_season_name() -> str:
+    m = datetime.now(timezone.utc).month
+    if m in (3, 4, 5):   return "🌱 весна"
+    if m in (6, 7, 8):   return "☀️ лето"
+    if m in (9, 10, 11): return "🍂 осень"
+    return "❄️ зима"
+
+# ================= БАЗОВЫЙ API-ЗАПРОС =================
 async def _raw_api_get(url: str, params: dict) -> dict:
-    """Выполняет запрос к iNaturalist с экспоненциальным backoff и поддержкой Retry-After.
-    При 429 читает заголовок Retry-After и ждёт указанное время.
-    При сетевых ошибках повторяет до 4 раз с нарастающей паузой.
-    """
     max_retries = 4
     backoff     = 1.0
     for attempt in range(max_retries):
@@ -367,55 +374,97 @@ async def _raw_api_get(url: str, params: dict) -> dict:
                 async with http_session.get(
                     url, params=params, timeout=aiohttp.ClientTimeout(total=12)
                 ) as r:
-                    # 1B: логируем заголовки лимитов для диагностики
                     remaining = r.headers.get("X-RateLimit-Remaining")
-                    limit     = r.headers.get("X-RateLimit-Limit")
                     if remaining is not None:
-                        logger.debug(f"iNat rate limit: {remaining}/{limit} remaining [{url}]")
-
+                        logger.debug(f"iNat rate limit: {remaining} remaining [{url}]")
                     if r.status == 429:
                         ra   = r.headers.get("Retry-After", "")
                         wait = float(ra) if ra.isdigit() else backoff
-                        logger.warning(
-                            f"429 от iNaturalist {url} — жду {wait}s (попытка {attempt + 1})"
-                        )
+                        logger.warning(f"429 от iNaturalist — жду {wait}s (попытка {attempt + 1})")
                         await asyncio.sleep(wait)
                         backoff *= 2
                         continue
-
                     r.raise_for_status()
                     return await r.json()
-
             except (aiohttp.ClientResponseError, aiohttp.ClientConnectorError,
-                    asyncio.TimeoutError) as e:
-                logger.warning(f"API transient error [{url}] попытка {attempt + 1}: {e}")
+                    asyncio.TimeoutError) as ex:
+                logger.warning(f"API transient error [{url}] попытка {attempt + 1}: {ex}")
                 await asyncio.sleep(backoff)
                 backoff *= 2
                 continue
-            except Exception as e:
-                logger.exception(f"Неожиданная ошибка при запросе [{url}]: {e}")
+            except Exception as ex:
+                logger.exception(f"Неожиданная ошибка [{url}]: {ex}")
                 break
-
-    logger.error(f"API запрос окончательно не удался [{url}] после {max_retries} попыток")
+    logger.error(f"API запрос не удался [{url}] после {max_retries} попыток")
     return {}
 
 async def api_get(url: str, params: dict) -> dict:
     return await _raw_api_get(url, params)
 
-# ================= API iNATURALIST =================
-async def get_species_counts(lat, lon, radius, days, page=1):
+# ================= EBIRD API =================
+async def _ebird_get(endpoint: str, params: dict) -> list:
+    """Запрос к eBird API. Возвращает [] при отсутствии ключа или ошибке."""
+    if not EBIRD_API_KEY:
+        return []
+    url     = f"{EBIRD_BASE}{endpoint}"
+    headers = {"X-eBirdApiToken": EBIRD_API_KEY}
+    try:
+        async with http_session.get(
+            url, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 429:
+                logger.warning("eBird rate limit hit")
+                return []
+            r.raise_for_status()
+            return await r.json()
+    except Exception as ex:
+        logger.warning(f"eBird API error [{endpoint}]: {ex}")
+        return []
+
+async def get_ebird_notable(lat: float, lon: float, dist: int = 25, back: int = 14) -> list:
+    """Редкие/необычные наблюдения поблизости по данным eBird (curated reviewers)."""
+    key   = (round(lat, 2), round(lon, 2), dist)
+    entry = _ebird_notable_cache.get(key)
+    if entry and (time() - entry[0]) < EBIRD_NOTABLE_TTL:
+        return entry[1]
+    results = await _ebird_get("/data/obs/geo/recent/notable", {
+        "lat": round(lat, 4), "lng": round(lon, 4),
+        "dist": min(dist, 50), "back": min(back, 30),
+        "detail": "simple", "hotspot": "false",
+    })
+    _ebird_notable_cache.set(key, (time(), results))
+    return results
+
+async def get_ebird_hotspots(lat: float, lon: float, dist: int = 25) -> list:
+    """Ближайшие eBird-хотспоты с числом видов."""
+    key   = (round(lat, 2), round(lon, 2), dist)
+    entry = _hotspot_cache.get(key)
+    if entry and (time() - entry[0]) < HOTSPOT_CACHE_TTL:
+        return entry[1]
+    results = await _ebird_get("/ref/hotspot/geo", {
+        "lat": round(lat, 4), "lng": round(lon, 4),
+        "dist": min(dist, 50), "back": 30, "fmt": "json",
+    })
+    # Сортируем по числу видов (всего за всё время)
+    results = sorted(results, key=lambda h: h.get("numSpeciesAllTime", 0), reverse=True)[:10]
+    _hotspot_cache.set(key, (time(), results))
+    return results
+
+# ================= iNATURALIST API =================
+async def get_species_counts(lat, lon, radius, days, page=1, season_filter: bool = False):
     d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
-    data = await api_get(f"{API_BASE}/observations/species_counts", {
+    params = {
         "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1,
         "iconic_taxa": "Aves", "locale": "ru",
         "per_page": 10, "page": page, "order_by": "observations_count",
-    })
+    }
+    if season_filter:
+        params["month"] = datetime.now(timezone.utc).month
+    data = await api_get(f"{API_BASE}/observations/species_counts", params)
     return data.get("results", []), data.get("total_results", 0)
 
 async def get_recent_observations(lat, lon, radius, days) -> list:
-    """Наблюдения с общим кэшем по координатам.
-    10 пользователей из одного района → 1 запрос к API вместо 10.
-    """
     cached = _get_obs_cache(lat, lon, radius, days)
     if cached is not None:
         return cached
@@ -440,7 +489,6 @@ async def get_latest_observation_for_taxon(lat, lon, radius, days, taxon_id):
     return results[0] if results else None
 
 async def get_taxon_data(taxon_id: int) -> dict:
-    """Данные таксона с кэшем — используется во всех местах вместо прямого запроса."""
     cached = _get_taxon_cached(taxon_id)
     if cached is not None:
         return cached
@@ -486,11 +534,38 @@ async def get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids: li
             latest[tid] = obs
     return latest
 
-# ================= ИЗВЛЕЧЕНИЕ СЕМЕЙСТВА И ОТРЯДА =================
+# ================= ОПРЕДЕЛЕНИЕ ПТИЦЫ ПО ФОТО =================
+async def identify_bird_photo(photo_bytes: bytes, lat: float = None, lon: float = None) -> list:
+    """Отправляет фото в iNaturalist CV API, возвращает топ результатов (только птицы)."""
+    try:
+        form = aiohttp.FormData()
+        form.add_field("file", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
+        if lat is not None and lon is not None:
+            form.add_field("lat", str(round(lat, 2)))
+            form.add_field("lng", str(round(lon, 2)))
+        async with _api_semaphore:
+            async with http_session.post(
+                f"{API_BASE}/computervision/score_image",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                r.raise_for_status()
+                data = await r.json()
+        # Фильтруем только птиц (iconic_taxon_name == "Aves" или parent Aves)
+        results = []
+        for item in data.get("results", []):
+            t = item.get("taxon", {})
+            if t.get("iconic_taxon_name") == "Aves":
+                results.append(item)
+            if len(results) >= 5:
+                break
+        return results
+    except Exception as ex:
+        logger.error(f"CV API error: {ex}", exc_info=True)
+        return []
+
+# ================= ИЗВЛЕЧЕНИЕ ТАКСОНОМИИ И ФЛАГОВ =================
 def _extract_taxonomy(taxon_data: dict) -> tuple[str, str]:
-    """Возвращает (семейство, отряд) из данных таксона без доп. запросов.
-    iNaturalist включает список ancestors прямо в ответ /taxa/{id}.
-    """
     results = taxon_data.get("results", [])
     if not results:
         return "", ""
@@ -505,14 +580,27 @@ def _extract_taxonomy(taxon_data: dict) -> tuple[str, str]:
             order_name = name
     return family_name, order_name
 
-# ================= РЕДКОСТЬ И СЕЗОННОСТЬ (КОМБИНИРОВАННАЯ ЛОГИКА) =================
+def _extract_taxon_flags(taxon_data: dict) -> list[str]:
+    """Возвращает список значков-флагов: инвазивный, интродуцированный, эндемик."""
+    results = taxon_data.get("results", [])
+    if not results:
+        return []
+    t     = results[0]
+    flags = []
+    if t.get("introduced"):
+        flags.append("🌍 Интродуцированный вид")
+    if t.get("endemic"):
+        flags.append("📌 Эндемик")
+    # conservation_status уже используется в редкости — здесь не дублируем
+    return flags
+
+# ================= РЕДКОСТЬ И СЕЗОННОСТЬ =================
 async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int):
     d1_year = (datetime.now().date() - timedelta(days=365)).isoformat()
 
     taxon_cached = _get_taxon_cached(taxon_id)
     hist_cached  = _get_hist_cached(taxon_id, lat, lon, radius)
 
-    # Запускаем только недостающие запросы, собираем именованные результаты
     yearly_task = api_get(f"{API_BASE}/observations/species_counts", {
         "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1_year,
         "taxon_id": taxon_id, "iconic_taxa": "Aves", "per_page": 1,
@@ -530,40 +618,30 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
         if hist_cached is None else None
     )
 
-    gather_tasks = [t for t in (yearly_task, taxon_task, hist_task) if t is not None]
+    gather_tasks   = [t for t in (yearly_task, taxon_task, hist_task) if t is not None]
     gather_results = await asyncio.gather(*gather_tasks)
-    result_iter = iter(gather_results)
+    result_iter    = iter(gather_results)
 
-    yearly_data = next(result_iter)  # yearly_task всегда первый
+    yearly_data = next(result_iter)
     taxon_data  = next(result_iter) if taxon_task  is not None else taxon_cached
     season_data = next(result_iter) if hist_task   is not None else hist_cached
 
-    if taxon_task is not None:
-        _set_taxon_cache(taxon_id, taxon_data)
-    if hist_task is not None:
-        _set_hist_cache(taxon_id, lat, lon, radius, season_data)
+    if taxon_task  is not None: _set_taxon_cache(taxon_id, taxon_data)
+    if hist_task   is not None: _set_hist_cache(taxon_id, lat, lon, radius, season_data)
 
-    # --- КОМБИНИРОВАННАЯ ЛОГИКА РЕДКОСТИ ---
-    # Локальные наблюдения за год
-    local_count = 0
+    # --- Редкость ---
+    local_count   = 0
     if yearly_data.get("results"):
         local_count = yearly_data["results"][0].get("count", 0)
 
-    # Статус охраны и глобальное число наблюдений — из данных таксона, без доп. запросов
     is_threatened = False
     global_count  = 0
-    if taxon_data.get("results"):
+    if taxon_data and taxon_data.get("results"):
         t             = taxon_data["results"][0]
         cs            = (t.get("conservation_status") or {})
         is_threatened = cs.get("status", "").lower() in ("cr", "en", "vu")
         global_count  = t.get("observations_count", 0)
 
-    # Правила (в порядке приоритета):
-    # 1. Охраняемый (CR/EN/VU) → всегда 🔴
-    # 2. Глобально > RARITY_GLOBAL_COMMON_THRESHOLD → 🟢 (воробей, синица — никогда не будут красными)
-    # 3. Глобально ≤ RARITY_GLOBAL_COMMON_THRESHOLD и локально ≤ RARITY_LOCAL_RARE_THRESHOLD → 🔴 редкая в этом районе
-    # 4. Глобально ≤ RARITY_GLOBAL_COMMON_THRESHOLD и локально 6–RARITY_LOCAL_UNCOMMON_THRESHOLD → 🟡 нечасто встречается
-    # 5. Иначе → 🟢 обычная редкость
     if is_threatened:
         rare_emoji, rare_label = "🔴", "охраняемый вид"
     elif global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
@@ -575,10 +653,10 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
     else:
         rare_emoji, rare_label = "🟢", "обычная редкость"
 
-    # --- СЕЗОННОСТЬ ---
+    # --- Сезонность ---
     MONTHS      = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
     season_text = ""
-    raw_hist    = season_data.get("results") or {}
+    raw_hist    = (season_data or {}).get("results") or {}
     if raw_hist:
         hist: dict[str, int] = {}
         for k, v in raw_hist.items():
@@ -618,18 +696,15 @@ def _parse_obs_coords(obs: dict) -> tuple[float | None, float | None]:
 
 # ================= ФОТО И ЭКРАНИРОВАНИЕ =================
 def get_photo_url(obs: dict, size: str = "medium") -> str | None:
-    """Возвращает URL фото наблюдения нужного размера или None."""
     if obs.get("photos"):
         return obs["photos"][0]["url"].replace("square", size)
     return None
 
 def e(text: str) -> str:
-    """Экранирует строку для вставки в HTML (parse_mode='HTML')."""
     return html_module.escape(str(text))
 
-# ================= ГЛАВНАЯ КЛАВИАТУРА =================
+# ================= КЛАВИАТУРА =================
 async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    """Динамическая клавиатура — счётчик вишлиста из кэша, инвалидируется при изменениях."""
     if user_id not in _fav_count_cache:
         rows = await db_fetch_all(
             "SELECT COUNT(*) FROM favorites WHERE telegram_id = ?", (user_id,)
@@ -637,15 +712,23 @@ async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         _fav_count_cache[user_id] = rows[0][0] if rows else 0
     fav_count = _fav_count_cache[user_id]
     fav_label = f"⭐ Вишлист ({fav_count})" if fav_count else "⭐ Вишлист"
-    return ReplyKeyboardMarkup(
-        keyboard=[
-	    [KeyboardButton(text="🐦 Сканировать")],
-            [KeyboardButton(text="🚨 Проверить редких птиц"), KeyboardButton(text=fav_label)],
-            [KeyboardButton(text="📍 Отправить геолокацию", request_location=True), KeyboardButton(text="🏠 Указать город")],
-            [KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True,
-    )
+    ebird_ok  = bool(EBIRD_API_KEY)
+    kb = [
+        # Главные действия — первый ряд
+        [KeyboardButton(text="🐦 Сканировать"), KeyboardButton(text="📷 Определить птицу")],
+        # Оповещения и списки
+        [KeyboardButton(text="🚨 Редкие птицы"), KeyboardButton(text=fav_label)],
+    ]
+    if ebird_ok:
+        kb.append([KeyboardButton(text="🗺 Хотспоты рядом"), KeyboardButton(text="⚙️ Настройки")])
+    else:
+        kb.append([KeyboardButton(text="⚙️ Настройки")])
+    # Геолокация и город — вниз
+    kb.append([
+        KeyboardButton(text="📍 Геолокация", request_location=True),
+        KeyboardButton(text="🏠 Город"),
+    ])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
 @router.errors()
@@ -668,12 +751,12 @@ async def start(message: Message, state: FSMContext):
     await state.clear()
     await db_exec("""
         INSERT OR IGNORE INTO users
-        (telegram_id, lat, lon, radius, period_days, alerts_enabled)
-        VALUES (?, NULL, NULL, 10, 7, 1)
+        (telegram_id, lat, lon, radius, period_days, alerts_enabled, season_filter)
+        VALUES (?, NULL, NULL, 10, 7, 1, 0)
     """, (message.from_user.id,))
     await message.answer(
         "🐦 <b>BAM – Birds Around Me</b>\n\n"
-        "Нажмите «🏠 Указать город» или «📍 Отправить геолокацию» для начала!\n\n"
+        "Нажмите «🏠 Город» или «📍 Геолокация» для начала!\n\n"
         "Команды:\n/help — справка\n/cancel — отменить текущий ввод",
         reply_markup=await main_keyboard(message.from_user.id),
         parse_mode="HTML",
@@ -686,17 +769,20 @@ async def cancel(message: Message, state: FSMContext):
 
 @router.message(Command("help"))
 async def help_cmd(message: Message):
+    ebird_text = "\n🗺 Хотспоты рядом — лучшие места для наблюдения птиц поблизости" if EBIRD_API_KEY else ""
     await message.answer(
         "🐦 <b>BAM – Birds Around Me</b>\n\n"
         "<b>Кнопки:</b>\n"
         "🐦 Сканировать — список птиц в радиусе\n"
-        "🚨 Проверить редких птиц — показывает редкие в выбранном радиусе виды\n"
-        "⭐ Вишлист — каждую птицу можно добавить в избранное. Вам будут приходить уведомления об их появлении поблизости\n"
+        "📷 Определить птицу — пришлите фото, бот определит вид\n"
+        "🚨 Редкие птицы — охраняемые и необычные виды рядом"
+        + ebird_text + "\n"
+        "⭐ Вишлист — уведомления об избранных птицах\n"
         "🏠 Город — задать населённый пункт\n"
         "📍 Геолокация — передать координаты\n"
-        "⚙️ Настройки — радиус, период, уведомления\n\n"
-        "<b>Использовать бота в чатах:</b>\n"
-        "Введите <code>@birdsaroundmebot скворец</code> (или другой вид) в любом чате. Но перед этим добавьте бота в чат!\n\n"
+        "⚙️ Настройки — радиус, период, сезонный фильтр, уведомления\n\n"
+        "<b>Inline-режим:</b>\n"
+        "Введите <code>@birdsaroundmebot скворец</code> в любом чате.\n\n"
         "<b>Команды:</b>\n"
         "/cancel — выйти из режима ввода",
         parse_mode="HTML",
@@ -722,23 +808,23 @@ async def handle_location(message: Message, state: FSMContext):
         parse_mode="HTML",
     )
 
-# ================= УКАЗАТЬ ГОРОД (FSM) =================
-@router.message(F.text == "🏠 Указать город")
+# ================= УКАЗАТЬ ГОРОД =================
+@router.message(F.text == "🏠 Город")
 async def request_city(message: Message, state: FSMContext):
     if not message.from_user:
         return
     await state.set_state(Form.waiting_city)
     await message.answer(
         "🏠 Напишите название города или населённого пункта:\n\n"
-        "Примеры: Москва 🔹 Ярославль 🔹 Helsinki\n\nЧтобы выйти, нажмите /cancel или /help для вызова меню справки."
+        "Примеры: Москва 🔹 Ярославль 🔹 Helsinki\n\nЧтобы выйти, нажмите /cancel"
     )
 
 @router.message(Form.waiting_city)
 async def handle_city_input(message: Message, state: FSMContext):
     if not message.from_user:
         return
-    uid  = message.from_user.id
-    now  = time()
+    uid = message.from_user.id
+    now = time()
     if now - _geocode_cooldown.get(uid, 0) < GEOCODE_COOLDOWN_SEC:
         await message.answer("⏳ Подождите секунду перед следующим поиском.")
         return
@@ -749,7 +835,7 @@ async def handle_city_input(message: Message, state: FSMContext):
         await message.answer("❌ Слишком короткое название. Введите хотя бы 2 символа.")
         return
     if len(text) > 100:
-        await message.answer("❌ Слишком длинное название. Попробуйте короче.")
+        await message.answer("❌ Слишком длинное название.")
         return
     lat, lon, display_name = await geocode_city(text)
     if lat is None:
@@ -771,7 +857,90 @@ async def handle_city_input(message: Message, state: FSMContext):
         parse_mode="HTML",
     )
 
-# ================= СКАНИРОВАНИЕ С ПАГИНАЦИЕЙ И КЭШЕМ =================
+# ================= 📷 ОПРЕДЕЛЕНИЕ ПТИЦЫ ПО ФОТО =================
+@router.message(F.text == "📷 Определить птицу")
+async def ask_for_photo(message: Message):
+    await message.answer(
+        "📷 <b>Определение птицы по фото</b>\n\n"
+        "Просто пришлите фотографию птицы — я постараюсь определить вид!\n\n"
+        "Советы для лучшего результата:\n"
+        "• Птица должна быть чётко видна\n"
+        "• Хорошее освещение\n"
+        "• Фото целой птицы лучше фрагмента",
+        parse_mode="HTML",
+    )
+
+@router.message(F.photo)
+async def handle_photo(message: Message):
+    if not message.from_user:
+        return
+    uid     = message.from_user.id
+    wait_ms = await message.answer("🔍 Анализирую фото...")
+
+    # Получаем координаты пользователя для уточнения результата
+    row = await db_fetch_one("SELECT lat, lon FROM users WHERE telegram_id = ?", (uid,))
+    lat, lon = (row[0], row[1]) if row and row[0] else (None, None)
+
+    # Скачиваем фото (берём наибольшее)
+    photo   = message.photo[-1]
+    file    = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file.file_path}"
+    try:
+        async with http_session.get(file_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            r.raise_for_status()
+            photo_bytes = await r.read()
+    except Exception as ex:
+        await wait_ms.delete()
+        logger.error(f"Ошибка загрузки фото: {ex}")
+        await message.answer("❌ Не удалось загрузить фото. Попробуйте ещё раз.")
+        return
+
+    results = await identify_bird_photo(photo_bytes, lat, lon)
+    await wait_ms.delete()
+
+    if not results:
+        await message.answer(
+            "😕 Не удалось определить вид птицы по этому фото.\n\n"
+            "Попробуйте фото с лучшим освещением и более крупным планом птицы."
+        )
+        return
+
+    text = "🐦 <b>Возможные виды:</b>\n\n"
+    kb_rows = []
+    for i, item in enumerate(results[:5], 1):
+        t     = item.get("taxon", {})
+        name  = t.get("preferred_common_name") or t.get("name", "Неизвестно")
+        sci   = t.get("name", "")
+        score = item.get("combined_score", 0)
+        pct   = round(score * 100)
+        # Полоска уверенности
+        bar_len = round(pct / 10)
+        bar = "█" * bar_len + "░" * (10 - bar_len)
+        text += f"<b>{i}. {e(name)}</b> <i>{e(sci)}</i>\n{bar} {pct}%\n\n"
+        tid = t.get("id")
+        if tid:
+            kb_rows.append([InlineKeyboardButton(
+                text=f"{i}. {name}",
+                callback_data=f"bird:{tid}:0",
+            )])
+
+    if lat is not None:
+        text += "📍 <i>Результат уточнён по вашему местоположению</i>"
+    else:
+        text += "💡 <i>Укажите город или геолокацию для более точного определения</i>"
+
+    kb_rows.append([InlineKeyboardButton(
+        text="🐦 Открыть карточку первого вида",
+        callback_data=f"bird:{results[0]['taxon']['id']}:0",
+    )])
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+# ================= СКАНИРОВАНИЕ =================
 @router.message(F.text.startswith("🐦 Сканировать"))
 async def scan(message: Message):
     if not message.from_user:
@@ -787,7 +956,7 @@ async def scan(message: Message):
     await wait_msg.delete()
 
     if text is None:
-        return await message.answer("❌ Сначала укажите город кнопкой «🏠 Указать город»!")
+        return await message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("scan_page:"))
@@ -812,26 +981,35 @@ async def scan_page_cb(callback: CallbackQuery):
 
 async def _build_scan_content(user_id: int, page: int):
     row = await db_fetch_one(
-        "SELECT lat, lon, radius, period_days FROM users WHERE telegram_id = ?", (user_id,)
+        "SELECT lat, lon, radius, period_days, season_filter FROM users WHERE telegram_id = ?",
+        (user_id,)
     )
     if not row or not row[0]:
         return None, None
 
-    lat, lon, radius, days = row
+    lat, lon, radius, days, season_filter = row
+    season_filter = bool(season_filter)
 
     cached_text, cached_species = _get_scan_cache(user_id, page)
     if cached_text is not None and cached_species is not None:
         total_pages = _get_total_pages_cached(user_id, page)
         return cached_text, _build_scan_keyboard(cached_species, page, total_pages)
 
-    species, total = await get_species_counts(lat, lon, radius, days, page=page)
+    species, total = await get_species_counts(lat, lon, radius, days, page=page,
+                                              season_filter=season_filter)
     if not species:
+        if season_filter:
+            return (f"😕 В этом радиусе пока нет наблюдений птиц "
+                    f"за {current_season_name()}.\n"
+                    f"Попробуйте отключить сезонный фильтр в ⚙️ Настройках."), None
         return "😕 В этом радиусе пока нет наблюдений птиц.", None
 
-    total_pages = max(1, (total + 9) // 10)
+    total_pages  = max(1, (total + 9) // 10)
+    season_note  = f"🌿 Сезонный фильтр: {current_season_name()}\n" if season_filter else ""
     text = (
         f"🐦 <b>Птицы рядом с вами</b>\n\n"
         f"Радиус: {radius} км · Период: {days} дн.\n"
+        f"{season_note}"
         f"Страница {page} из {total_pages}\n\n"
     )
     for i, s in enumerate(species, start=(page - 1) * 10 + 1):
@@ -856,7 +1034,7 @@ def _build_scan_keyboard(species: list, page: int, total_pages: int) -> InlineKe
     if page > 1:
         nav.append(InlineKeyboardButton(text="← Назад", callback_data=f"scan_page:{page - 1}"))
     if page < total_pages:
-        nav.append(InlineKeyboardButton(text="Ещё →",   callback_data=f"scan_page:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="Ещё →", callback_data=f"scan_page:{page + 1}"))
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -909,11 +1087,14 @@ async def show_bird(callback: CallbackQuery):
     photo_medium   = get_photo_url(obs, "medium")
     photo_original = get_photo_url(obs, "original")
 
-    # Семейство и отряд — из кэшированных данных таксона, без доп. запросов
     family_name, order_name = _extract_taxonomy(taxon_data)
     taxonomy_str = ""
     if order_name or family_name:
         taxonomy_str = "🔬 " + " · ".join(filter(None, [e(order_name), e(family_name)])) + "\n"
+
+    # Флаги инвазивности / эндемичности
+    flags     = _extract_taxon_flags(taxon_data)
+    flags_str = ("".join(f"{fl}\n" for fl in flags)) if flags else ""
 
     fav_text = "❌ Убрать из вишлиста" if in_fav else "⭐ В вишлист"
     fav_data = f"fav_remove:{taxon_id}" if in_fav else f"fav_add:{taxon_id}"
@@ -928,13 +1109,15 @@ async def show_bird(callback: CallbackQuery):
     )
     if season_text:
         text += f"{season_text}\n"
+    if flags_str:
+        text += f"\n{flags_str}"
     text += "\nСамое свежее наблюдение в вашем радиусе."
 
     kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=obs_url)]]
     if photo_original:
         kb_rows.append([InlineKeyboardButton(text="🔍 Фото в полном размере", url=photo_original)])
     kb_rows.append([InlineKeyboardButton(text=fav_text, callback_data=fav_data)])
-    if back_page is not None:
+    if back_page is not None and back_page > 0:
         kb_rows.append([InlineKeyboardButton(text="← К списку", callback_data=f"scan_page:{back_page}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
@@ -957,7 +1140,7 @@ async def show_wishlist(message: Message):
         await message.answer(
             "⭐ <b>Вишлист пуст</b>\n\n"
             "Здесь появятся птицы, за которыми вы следите. "
-            "Бот будет уведомлять вас, когда они окажутся рядом.\n\n"
+            "Бот уведомит вас, когда они окажутся рядом.\n\n"
             "Откройте карточку любой птицы через «🐦 Сканировать» и нажмите «⭐ В вишлист».",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -994,7 +1177,6 @@ async def fav_add(callback: CallbackQuery):
     )
     _invalidate_fav_count(uid)
 
-    # Обновляем кнопку в карточке
     new_kb = _replace_fav_button(callback.message.reply_markup, taxon_id, added=True)
     try:
         if callback.message.photo:
@@ -1006,13 +1188,12 @@ async def fav_add(callback: CallbackQuery):
     except Exception:
         pass
 
-    # Обновляем счётчик в главной клавиатуре одним edit без лишнего сообщения
     await bot.send_message(
         uid, f"⭐ <b>{e(name)}</b> добавлен(а) в вишлист.",
         reply_markup=await main_keyboard(uid),
         parse_mode="HTML",
     )
-    await callback.answer(f"⭐ Добавлено в вишлист!", show_alert=False)
+    await callback.answer("⭐ Добавлено!", show_alert=False)
 
 @router.callback_query(F.data.startswith("fav_remove:"))
 async def fav_remove(callback: CallbackQuery):
@@ -1036,8 +1217,6 @@ async def fav_remove(callback: CallbackQuery):
         pass
 
     await callback.answer("❌ Удалено из вишлиста", show_alert=False)
-
-    # Обновляем счётчик в главной клавиатуре
     await bot.send_message(
         uid, "❌ Птица удалена из вишлиста.",
         reply_markup=await main_keyboard(uid),
@@ -1048,7 +1227,7 @@ def _replace_fav_button(markup: InlineKeyboardMarkup | None,
     if markup is None:
         return None
     new_text = "❌ Убрать из вишлиста" if added else "⭐ В вишлист"
-    new_data = f"fav_remove:{taxon_id}"   if added else f"fav_add:{taxon_id}"
+    new_data = f"fav_remove:{taxon_id}" if added else f"fav_add:{taxon_id}"
     new_rows = []
     for row in markup.inline_keyboard:
         new_row = []
@@ -1060,18 +1239,77 @@ def _replace_fav_button(markup: InlineKeyboardMarkup | None,
         new_rows.append(new_row)
     return InlineKeyboardMarkup(inline_keyboard=new_rows)
 
+# ================= 🗺 ХОТСПОТЫ =================
+@router.message(F.text == "🗺 Хотспоты рядом")
+async def show_hotspots(message: Message):
+    if not message.from_user:
+        return
+    if not EBIRD_API_KEY:
+        await message.answer("❌ Функция недоступна: не задан EBIRD_API_KEY.")
+        return
+
+    row = await db_fetch_one(
+        "SELECT lat, lon, radius FROM users WHERE telegram_id = ?",
+        (message.from_user.id,)
+    )
+    if not row or not row[0]:
+        await message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
+        return
+
+    lat, lon, radius = row
+    wait_msg = await message.answer("🗺 Ищу лучшие места для наблюдений...")
+
+    hotspots = await get_ebird_hotspots(lat, lon, dist=min(radius, 50))
+    await wait_msg.delete()
+
+    if not hotspots:
+        await message.answer(
+            "😕 Поблизости не найдено eBird-хотспотов.\n"
+            "Попробуйте увеличить радиус в ⚙️ Настройках."
+        )
+        return
+
+    text = "🗺 <b>Лучшие места для наблюдения птиц рядом</b>\n"
+    text += f"<i>Данные eBird · Радиус ~{min(radius, 50)} км</i>\n\n"
+
+    kb_rows = []
+    for i, hs in enumerate(hotspots[:8], 1):
+        name        = hs.get("locName", "Неизвестное место")
+        species_all = hs.get("numSpeciesAllTime", 0)
+        last_obs    = hs.get("latestObsDt", "")
+        hs_lat      = hs.get("lat")
+        hs_lon      = hs.get("lng")
+        dist_str    = ""
+        if hs_lat and hs_lon:
+            dist = haversine(lat, lon, hs_lat, hs_lon)
+            dist_str = f" · {dist} км"
+
+        text += f"<b>{i}. {e(name)}</b>\n"
+        text += f"🐦 {species_all} видов всего{dist_str}\n"
+        if last_obs:
+            text += f"🕒 Последнее наблюдение: {last_obs[:10]}\n"
+        text += "\n"
+
+        loc_id = hs.get("locId", "")
+        if loc_id:
+            kb_rows.append([InlineKeyboardButton(
+                text=f"📍 {name[:40]}",
+                url=f"https://ebird.org/hotspot/{loc_id}",
+            )])
+
+    await message.answer(text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None)
+
 # ================= НАСТРОЙКИ =================
-def _build_settings_content(r: int, d: int, alerts: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Возвращает (текст, клавиатура) для меню настроек.
-    Вынесено в отдельную функцию, чтобы и при открытии, и при toggle_alerts
-    меню строилось по одному и тому же коду с актуальными данными.
-    """
+def _build_settings_content(r: int, d: int, alerts: int, season: int) -> tuple[str, InlineKeyboardMarkup]:
     alerts_label = "включены ✅" if alerts else "выключены ❌"
+    season_label = f"включён ✅ ({current_season_name()})" if season else "выключен ❌"
     text = (
         f"⚙️ <b>Настройки</b>\n\n"
         f"Радиус: <b>{r} км</b>\n"
         f"Период: <b>{d} дней</b>\n"
-        f"Уведомления: <b>{alerts_label}</b>"
+        f"Уведомления: <b>{alerts_label}</b>\n"
+        f"Сезонный фильтр: <b>{season_label}</b>"
     )
 
     def _r(val):
@@ -1081,21 +1319,25 @@ def _build_settings_content(r: int, d: int, alerts: int) -> tuple[str, InlineKey
         return f"✅ {label}" if val == d else label
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Радиус",    callback_data="noop")],
+        [InlineKeyboardButton(text="🌐 Радиус поиска", callback_data="noop")],
         [InlineKeyboardButton(text=_r(5),  callback_data="set_r:5"),
          InlineKeyboardButton(text=_r(10), callback_data="set_r:10")],
         [InlineKeyboardButton(text=_r(25), callback_data="set_r:25"),
          InlineKeyboardButton(text=_r(50), callback_data="set_r:50")],
         [InlineKeyboardButton(text="✏️ Свой радиус", callback_data="set_r:custom")],
-        [InlineKeyboardButton(text="🕗 Период",    callback_data="noop")],
+        [InlineKeyboardButton(text="🕗 Период наблюдений", callback_data="noop")],
         [InlineKeyboardButton(text=_d(1,  "24 ч"),    callback_data="set_d:1"),
          InlineKeyboardButton(text=_d(3,  "3 дня"),   callback_data="set_d:3")],
         [InlineKeyboardButton(text=_d(7,  "7 дней"),  callback_data="set_d:7"),
          InlineKeyboardButton(text=_d(30, "30 дней"), callback_data="set_d:30")],
-        [InlineKeyboardButton(text="🔔 Уведомления", callback_data="noop")],
+        [InlineKeyboardButton(text="🔔 Уведомления и фильтры", callback_data="noop")],
         [InlineKeyboardButton(
             text="🔕 Выключить уведомления" if alerts else "🔔 Включить уведомления",
             callback_data="toggle_alerts",
+        )],
+        [InlineKeyboardButton(
+            text=f"🌿 Сезонный фильтр: {'вкл ✅' if season else 'выкл ❌'}",
+            callback_data="toggle_season",
         )],
     ])
     return text, kb
@@ -1103,9 +1345,9 @@ def _build_settings_content(r: int, d: int, alerts: int) -> tuple[str, InlineKey
 @router.message(F.text == "⚙️ Настройки")
 async def settings(message: Message):
     row = await db_fetch_one(
-        "SELECT radius, period_days, alerts_enabled FROM users WHERE telegram_id = ?",
+        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
         (message.from_user.id,),
-    ) or (10, 7, 1)
+    ) or (10, 7, 1, 0)
     text, kb = _build_settings_content(*row)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -1126,30 +1368,50 @@ async def goto_scan(callback: CallbackQuery):
     text, kb = await _build_scan_content(uid, page=1)
     await wait_msg.delete()
     if text is None:
-        await callback.message.answer("❌ Сначала укажите город кнопкой «🏠 Указать город»!")
+        await callback.message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
         return
     await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data == "toggle_alerts")
 async def toggle_alerts(callback: CallbackQuery):
     row     = await db_fetch_one(
-        "SELECT radius, period_days, alerts_enabled FROM users WHERE telegram_id = ?",
+        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
         (callback.from_user.id,),
-    ) or (10, 7, 1)
-    r, d, current = row
-    new_val = 0 if current else 1
+    ) or (10, 7, 1, 0)
+    r, d, current_alerts, season = row
+    new_val = 0 if current_alerts else 1
     await db_exec(
         "UPDATE users SET alerts_enabled = ? WHERE telegram_id = ?",
         (new_val, callback.from_user.id),
     )
-    # Перестраиваем меню с новым состоянием и обновляем сообщение прямо в чате
-    text, kb = _build_settings_content(r, d, new_val)
+    text, kb = _build_settings_content(r, d, new_val, season)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
     label = "включены ✅" if new_val else "выключены ❌"
     await callback.answer(f"🔔 Уведомления {label}", show_alert=False)
+
+@router.callback_query(F.data == "toggle_season")
+async def toggle_season(callback: CallbackQuery):
+    row = await db_fetch_one(
+        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
+        (callback.from_user.id,),
+    ) or (10, 7, 1, 0)
+    r, d, alerts, current_season = row
+    new_season = 0 if current_season else 1
+    await db_exec(
+        "UPDATE users SET season_filter = ? WHERE telegram_id = ?",
+        (new_season, callback.from_user.id),
+    )
+    _invalidate_scan_cache(callback.from_user.id)
+    text, kb = _build_settings_content(r, d, alerts, new_season)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    label = f"включён ({current_season_name()})" if new_season else "выключен"
+    await callback.answer(f"🌿 Сезонный фильтр {label}", show_alert=False)
 
 @router.callback_query(F.data.startswith("set_r:"))
 async def set_radius(callback: CallbackQuery, state: FSMContext):
@@ -1209,22 +1471,20 @@ async def set_days(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ================= ПРОВЕРКА РЕДКИХ ПТИЦ =================
+# ================= 🚨 РЕДКИЕ ПТИЦЫ =================
 def _obs_within_hours(obs: dict, cutoff: datetime) -> bool:
-    """Возвращает True если наблюдение попадает в окно после cutoff."""
     dt_str = obs.get("time_observed_at") or obs.get("observed_on") or ""
     if not dt_str:
         return False
     try:
         dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        # Если строка без timezone (только дата или naive datetime) — считаем UTC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt >= cutoff
     except Exception:
         return False
 
-@router.message(F.text == "🚨 Проверить редких птиц")
+@router.message(F.text == "🚨 Редкие птицы")
 async def manual_rare(message: Message):
     await check_rare_for_user(message.from_user.id, manual=True)
 
@@ -1240,14 +1500,12 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
 
     lat, lon, radius, days = row
 
-    # При ручном запросе — полный период пользователя (из общего кэша).
-    # При авто-уведомлении — только наблюдения за последние 3 часа, чтобы не спамить одним и тем же.
+    # iNaturalist наблюдения
     if manual:
         if observations is None:
             observations = await get_recent_observations(lat, lon, radius, days)
     else:
         if observations is None:
-            # Планировщик не передал наблюдения — запрашиваем самостоятельно
             d1_str = (datetime.now(timezone.utc) - timedelta(hours=AUTO_CHECK_WINDOW_HOURS)).date().isoformat()
             data   = await api_get(f"{API_BASE}/observations", {
                 "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1_str,
@@ -1256,19 +1514,20 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
             })
             observations = data.get("results", [])
         else:
-            # Фильтруем уже загруженные наблюдения по окну AUTO_CHECK_WINDOW_HOURS — без лишнего API-запроса
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=AUTO_CHECK_WINDOW_HOURS)
-            observations = [
-                obs for obs in observations
-                if _obs_within_hours(obs, cutoff)
-            ]
+            cutoff       = datetime.now(timezone.utc) - timedelta(hours=AUTO_CHECK_WINDOW_HOURS)
+            observations = [obs for obs in observations if _obs_within_hours(obs, cutoff)]
 
-    if not observations:
+    # eBird notable birds (только при ручном запросе или авто с ключом)
+    ebird_notables = []
+    if EBIRD_API_KEY:
+        ebird_notables = await get_ebird_notable(lat, lon, dist=min(radius, 50))
+
+    if not observations and not ebird_notables:
         if manual:
             await bot.send_message(telegram_id, "✅ Пока нет редких птиц в вашем радиусе.")
         return
 
-    # Cooldown: какие виды уже получали уведомление за последние 24 часа
+    # Cooldown для авто-режима
     recent_notified: set[int] = set()
     if not manual:
         rows = await db_fetch_all(
@@ -1278,20 +1537,18 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         )
         recent_notified = {r[0] for r in rows}
 
-    taxon_count: dict[int, list] = defaultdict(list)
-    for obs in observations:
-        taxon_count[obs["taxon"]["id"]].append(obs)
-
     found_any  = False
     sent_count = 0
     now_str    = datetime.now(timezone.utc).isoformat()
 
+    # --- iNaturalist: охраняемые виды ---
+    taxon_count: dict[int, list] = defaultdict(list)
+    for obs in observations:
+        taxon_count[obs["taxon"]["id"]].append(obs)
+
     for tid, bird_obs in taxon_count.items():
-        # Лимит 3 авто-уведомления за один запуск планировщика
         if not manual and sent_count >= 3:
             break
-
-        # Берём самое свежее наблюдение по виду (список уже отсортирован desc)
         obs = bird_obs[0]
         obs_lat, obs_lon = _parse_obs_coords(obs)
         if obs_lat is None:
@@ -1300,7 +1557,6 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         if dist > radius:
             continue
 
-        # Фильтр редкости: только охраняемые виды CR/EN/VU.
         if not manual:
             taxon_data = _get_taxon_cached(tid)
             if taxon_data and taxon_data.get("results"):
@@ -1309,10 +1565,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
                 if status not in ("cr", "en", "vu"):
                     continue
             else:
-                # Нет данных в кэше — пропускаем, не делаем лишний API-запрос
                 continue
-
-            # Cooldown: не слать повторно раньше 24 часов
             if tid in recent_notified:
                 continue
 
@@ -1323,7 +1576,8 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         url   = f"https://www.inaturalist.org/observations/{obs['id']}"
         text  = (
             f"🚨 <b>Редкое наблюдение рядом!</b>\n\n"
-            f"<b>{e(name)}</b>\n📍 {dist} км от вас\n🕒 {ago}"
+            f"<b>{e(name)}</b>\n📍 {dist} км от вас\n🕒 {ago}\n"
+            f"<i>Источник: iNaturalist (охраняемый вид)</i>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
@@ -1344,14 +1598,63 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
                 )
                 await db_conn.commit()
             except Exception:
-                logger.error(f"Ошибка записи rare_notifications для user {telegram_id}", exc_info=True)
+                logger.error(f"Ошибка rare_notifications для user {telegram_id}", exc_info=True)
+
+    # --- eBird notable birds ---
+    if ebird_notables and (manual or sent_count < 3):
+        sent_ebird = 0
+        # Дедупликация: не показывать виды, уже показанные из iNat
+        shown_names: set[str] = set()
+
+        for notable in ebird_notables:
+            if not manual and (sent_count + sent_ebird) >= 3:
+                break
+
+            com_name = notable.get("comName", "")
+            sci_name = notable.get("sciName", "")
+            if not com_name:
+                continue
+            if com_name.lower() in shown_names:
+                continue
+
+            nb_lat = notable.get("lat")
+            nb_lon = notable.get("lng")
+            dist_str = ""
+            if nb_lat and nb_lon:
+                dist_nb = haversine(lat, lon, nb_lat, nb_lon)
+                if dist_nb > radius * 1.5:
+                    continue
+                dist_str = f"📍 {dist_nb} км от вас\n"
+
+            obs_dt  = notable.get("obsDt", "")[:10]
+            how_many = notable.get("howMany")
+            count_str = f" ({how_many} особ.)" if how_many else ""
+
+            loc_name = notable.get("locName", "")
+            text = (
+                f"🚨 <b>Необычное наблюдение рядом!</b>\n\n"
+                f"<b>{e(com_name)}</b> <i>{e(sci_name)}</i>{count_str}\n"
+                f"{dist_str}"
+                f"📅 {obs_dt}\n"
+                f"📍 {e(loc_name)}\n"
+                f"<i>Источник: eBird (необычный вид для этого района)</i>"
+            )
+            loc_id = notable.get("locId", "")
+            url    = f"https://ebird.org/hotspot/{loc_id}" if loc_id else "https://ebird.org"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть на eBird →", url=url)
+            ]])
+            await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
+
+            found_any = True
+            shown_names.add(com_name.lower())
+            sent_ebird += 1
 
     if manual and not found_any:
         await bot.send_message(telegram_id, "✅ Пока нет редких птиц в вашем радиусе.")
 
-# ================= ПРОВЕРКА ВИШЛИСТА =================
-async def check_watchlist_for_user(telegram_id: int,
-                                    observations: list | None = None):
+# ================= ВИШЛИСТ ПРОВЕРКА =================
+async def check_watchlist_for_user(telegram_id: int, observations: list | None = None):
     row  = await db_fetch_one(
         "SELECT lat, lon, radius, period_days FROM users WHERE telegram_id = ?", (telegram_id,)
     )
@@ -1366,22 +1669,20 @@ async def check_watchlist_for_user(telegram_id: int,
     taxon_ids = [f[0] for f in favs]
 
     if observations:
-        # Сначала пробуем взять данные из уже загруженного списка наблюдений —
-        # без лишнего API-запроса. Берём самое свежее наблюдение по каждому taxon_id.
         latest_map: dict = {}
         watched_set = set(taxon_ids)
         for obs in observations:
             tid = obs["taxon"]["id"]
             if tid in watched_set and tid not in latest_map:
                 latest_map[tid] = obs
-        # Для видов, которых нет в общем списке — запрашиваем отдельно
         missing = [tid for tid in taxon_ids if tid not in latest_map]
         if missing:
             extra = await get_batch_watchlist_observations(lat, lon, radius, days, missing)
             latest_map.update(extra)
     else:
         latest_map = await get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids)
-    now_str    = datetime.now(timezone.utc).isoformat()
+
+    now_str = datetime.now(timezone.utc).isoformat()
 
     for taxon_id, taxon_name, last_notified_at in favs:
         obs = latest_map.get(taxon_id)
@@ -1438,9 +1739,6 @@ async def check_bird_alert_for_user(telegram_id: int, lat: float, lon: float,
             if obs_lat is not None:
                 seen[tid] = obs
 
-    # notified_tids — птицы, которым отправили уведомление.
-    # last_seen_at обновляем ТОЛЬКО для них.
-    # Остальные (лимит 3) сохранят старую дату и попадут в очередь на следующий час.
     notified_tids: set[int] = set()
     alerts_sent = 0
 
@@ -1470,7 +1768,6 @@ async def check_bird_alert_for_user(telegram_id: int, lat: float, lon: float,
 
     try:
         for tid in notified_tids:
-            # Обновляем дату только тем, кто получил уведомление
             await db_conn.execute(
                 """INSERT INTO species_history (telegram_id, taxon_id, last_seen_at)
                    VALUES (?, ?, ?)
@@ -1480,8 +1777,6 @@ async def check_bird_alert_for_user(telegram_id: int, lat: float, lon: float,
             )
         for tid in seen:
             if tid not in notified_tids:
-                # Новые виды добавляем в историю только если записи ещё нет,
-                # чтобы они появились в системе, но не потеряли «долг» по уведомлению
                 await db_conn.execute(
                     "INSERT OR IGNORE INTO species_history (telegram_id, taxon_id, last_seen_at) "
                     "VALUES (?, ?, ?)",
@@ -1490,12 +1785,10 @@ async def check_bird_alert_for_user(telegram_id: int, lat: float, lon: float,
         await db_conn.commit()
     except Exception:
         await db_conn.rollback()
-        logger.error(f"Ошибка при обновлении species_history для user {telegram_id}", exc_info=True)
+        logger.error(f"Ошибка species_history для user {telegram_id}", exc_info=True)
 
 # ================= ПЛАНИРОВЩИК =================
 async def _run_checks_for_user(uid: int, lat: float, lon: float, radius: int, days: int):
-    """Загружаем наблюдения один раз — общий кэш по координатам делает это бесплатным
-    для пользователей из одного района."""
     try:
         observations = await get_recent_observations(lat, lon, radius, days)
         await asyncio.gather(
@@ -1508,7 +1801,6 @@ async def _run_checks_for_user(uid: int, lat: float, lon: float, radius: int, da
         logger.error(f"Ошибка при проверке пользователя {uid}", exc_info=True)
 
 async def scheduled_checks():
-    """Каждый час проверяет всех пользователей с включёнными уведомлениями."""
     users = await db_fetch_all(
         "SELECT telegram_id, lat, lon, radius, period_days "
         "FROM users WHERE alerts_enabled = 1 AND lat IS NOT NULL"
@@ -1540,8 +1832,24 @@ async def inline_search(inline_query: InlineQuery):
         )
         return
 
+    uid  = inline_query.from_user.id
+
+    # Получаем координаты пользователя для показа ближайшего наблюдения
+    user_row = await db_fetch_one(
+        "SELECT lat, lon, radius, period_days FROM users WHERE telegram_id = ?", (uid,)
+    )
+
     taxa    = await search_taxa_by_name(query)
     results = []
+
+    # Если есть координаты, параллельно запрашиваем ближайшие наблюдения
+    nearest_obs: dict[int, dict] = {}
+    if user_row and user_row[0] and taxa:
+        lat, lon, radius, days = user_row
+        taxon_ids = [t["id"] for t in taxa[:5]]
+        batch_obs = await get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids)
+        nearest_obs = batch_obs
+
     for t in taxa[:8]:
         name     = t.get("preferred_common_name") or t.get("name", "")
         sci_name = t.get("name", "")
@@ -1551,15 +1859,35 @@ async def inline_search(inline_query: InlineQuery):
             thumb = t["default_photo"].get("square_url") or t["default_photo"].get("medium_url")
 
         inat_url = f"https://www.inaturalist.org/taxa/{tid}"
+
+        # Описание: добавляем ближайшее наблюдение если есть
+        description = sci_name
+        nearest_text = ""
+        if tid in nearest_obs and user_row:
+            obs  = nearest_obs[tid]
+            ago  = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
+            obs_lat, obs_lon = _parse_obs_coords(obs)
+            if obs_lat is not None:
+                dist = haversine(user_row[0], user_row[1], obs_lat, obs_lon)
+                nearest_text = f"\n\n📍 Замечена {dist} км от вас · {ago}"
+                description  = f"{sci_name} · {dist} км от вас, {ago}"
+
+        obs_link = ""
+        if tid in nearest_obs:
+            obs_id   = nearest_obs[tid].get("id")
+            obs_link = f"\n🔗 <a href='https://www.inaturalist.org/observations/{obs_id}'>Последнее наблюдение</a>"
+
         msg_text = (
-            f"🐦 <b>{e(name)}</b>  <i>{e(sci_name)}</i>\n\n"
-            f"🔗 <a href='{inat_url}'>Открыть на iNaturalist</a>\n\n"
-            f"Проверь, есть ли эта птица рядом → @{BOT_USERNAME}"
+            f"🐦 <b>{e(name)}</b>  <i>{e(sci_name)}</i>"
+            f"{nearest_text}\n\n"
+            f"🔗 <a href='{inat_url}'>Открыть на iNaturalist</a>"
+            f"{obs_link}\n\n"
+            f"Слежу за птицами → @{BOT_USERNAME}"
         )
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title=name,
-            description=sci_name,
+            description=description,
             thumbnail_url=thumb,
             input_message_content=InputTextMessageContent(
                 message_text=msg_text, parse_mode="HTML",
@@ -1575,7 +1903,7 @@ async def main():
     try:
         await init_db()
     except Exception:
-        logger.critical("Не удалось инициализировать БД — завершение работы", exc_info=True)
+        logger.critical("Не удалось инициализировать БД", exc_info=True)
         raise
 
     db_conn = await aiosqlite.connect(DB_NAME, check_same_thread=False)
@@ -1583,7 +1911,6 @@ async def main():
     await db_conn.execute("PRAGMA synchronous=NORMAL")
     db_conn.row_factory = aiosqlite.Row
 
-    # TCPConnector согласует число сокетов с семафором — меньше contention
     http_session   = aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=API_SEMAPHORE_LIMIT)
     )
@@ -1593,11 +1920,16 @@ async def main():
     BOT_USERNAME = bot_info.username
     logger.info(f"Бот запущен как @{BOT_USERNAME}")
 
+    if EBIRD_API_KEY:
+        logger.info("eBird API ключ найден — хотспоты и notable birds активны")
+    else:
+        logger.info("EBIRD_API_KEY не задан — eBird-функции отключены")
+
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(scheduled_checks,    "interval", hours=1,
+    scheduler.add_job(scheduled_checks,        "interval", hours=1,
                       max_instances=1, misfire_grace_time=300)
-    scheduler.add_job(_cleanup_scan_cache,        "interval", minutes=10)
-    scheduler.add_job(_cleanup_cooldowns,          "interval", minutes=5)
+    scheduler.add_job(_cleanup_scan_cache,      "interval", minutes=10)
+    scheduler.add_job(_cleanup_cooldowns,        "interval", minutes=5)
     scheduler.add_job(_cleanup_rare_notifications, "interval", hours=6)
     scheduler.start()
 
