@@ -714,21 +714,25 @@ async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     fav_label = f"⭐ Вишлист ({fav_count})" if fav_count else "⭐ Вишлист"
     ebird_ok  = bool(EBIRD_API_KEY)
     kb = [
-        # Главные действия — первый ряд
         [KeyboardButton(text="🐦 Сканировать"), KeyboardButton(text="📷 Определить птицу")],
-        # Оповещения и списки
         [KeyboardButton(text="🚨 Редкие птицы"), KeyboardButton(text=fav_label)],
     ]
     if ebird_ok:
         kb.append([KeyboardButton(text="🗺 Хотспоты рядом"), KeyboardButton(text="⚙️ Настройки")])
     else:
         kb.append([KeyboardButton(text="⚙️ Настройки")])
-    # Геолокация и город — вниз
-    kb.append([
-        KeyboardButton(text="📍 Геолокация", request_location=True),
-        KeyboardButton(text="🏠 Город"),
-    ])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+# Временная клавиатура для запроса геолокации из настроек
+def _location_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(text="📍 Отправить геолокацию", request_location=True),
+            KeyboardButton(text="❌ Отмена"),
+        ]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 # ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
 @router.errors()
@@ -756,7 +760,8 @@ async def start(message: Message, state: FSMContext):
     """, (message.from_user.id,))
     await message.answer(
         "🐦 <b>BAM – Birds Around Me</b>\n\n"
-        "Нажмите «🏠 Город» или «📍 Геолокация» для начала!\n\n"
+        "Чтобы начать, откройте <b>⚙️ Настройки</b> и укажите своё местоположение "
+        "— через поиск по городу или GPS-геолокацию.\n\n"
         "Команды:\n/help — справка\n/cancel — отменить текущий ввод",
         reply_markup=await main_keyboard(message.from_user.id),
         parse_mode="HTML",
@@ -778,9 +783,7 @@ async def help_cmd(message: Message):
         "🚨 Редкие птицы — охраняемые и необычные виды рядом"
         + ebird_text + "\n"
         "⭐ Вишлист — уведомления об избранных птицах\n"
-        "🏠 Город — задать населённый пункт\n"
-        "📍 Геолокация — передать координаты\n"
-        "⚙️ Настройки — радиус, период, сезонный фильтр, уведомления\n\n"
+        "⚙️ Настройки — радиус, период, местоположение, фильтры\n\n"
         "<b>Inline-режим:</b>\n"
         "Введите <code>@birdsaroundmebot скворец</code> в любом чате.\n\n"
         "<b>Команды:</b>\n"
@@ -803,20 +806,37 @@ async def handle_location(message: Message, state: FSMContext):
     _invalidate_scan_cache(message.from_user.id)
     place = await reverse_geocode(lat, lon)
     await message.answer(
-        f"✅ <b>Геолокация сохранена!</b>\n\n📍 {e(place)}\nТеперь можно сканировать!",
+        f"✅ <b>Геолокация сохранена!</b>\n\n📍 {e(place)}\n\n"
+        f"Теперь можно сканировать или вернуться в <b>⚙️ Настройки</b>.",
         reply_markup=await main_keyboard(message.from_user.id),
         parse_mode="HTML",
     )
 
-# ================= УКАЗАТЬ ГОРОД =================
-@router.message(F.text == "🏠 Город")
-async def request_city(message: Message, state: FSMContext):
-    if not message.from_user:
-        return
+# ================= УКАЗАТЬ ГОРОД (из настроек через callback) =================
+@router.callback_query(F.data == "set_city")
+async def settings_set_city(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_city)
-    await message.answer(
+    await callback.message.answer(
         "🏠 Напишите название города или населённого пункта:\n\n"
         "Примеры: Москва 🔹 Ярославль 🔹 Helsinki\n\nЧтобы выйти, нажмите /cancel"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "set_location_request")
+async def settings_set_location(callback: CallbackQuery):
+    await callback.message.answer(
+        "📍 Нажмите кнопку ниже, чтобы отправить геолокацию:",
+        reply_markup=_location_request_keyboard(),
+    )
+    await callback.answer()
+
+# Отмена из временной клавиатуры геолокации
+@router.message(F.text == "❌ Отмена")
+async def cancel_location_request(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Отменено.",
+        reply_markup=await main_keyboard(message.from_user.id),
     )
 
 @router.message(Form.waiting_city)
@@ -866,7 +886,7 @@ async def ask_for_photo(message: Message):
         "Советы для лучшего результата:\n"
         "• Птица должна быть чётко видна\n"
         "• Хорошее освещение\n"
-        "• Фото целой птицы лучше фрагмента",
+        "• Фото птицы целиком лучше фрагмента",
         parse_mode="HTML",
     )
 
@@ -1301,11 +1321,14 @@ async def show_hotspots(message: Message):
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None)
 
 # ================= НАСТРОЙКИ =================
-def _build_settings_content(r: int, d: int, alerts: int, season: int) -> tuple[str, InlineKeyboardMarkup]:
+def _build_settings_content(r: int, d: int, alerts: int, season: int,
+                             location_name: str = "") -> tuple[str, InlineKeyboardMarkup]:
     alerts_label = "включены ✅" if alerts else "выключены ❌"
     season_label = f"включён ✅ ({current_season_name()})" if season else "выключен ❌"
+    loc_str = f"\nМестоположение: <b>{e(location_name)}</b>" if location_name else ""
     text = (
-        f"⚙️ <b>Настройки</b>\n\n"
+        f"⚙️ <b>Настройки</b>\n"
+        f"{loc_str}\n"
         f"Радиус: <b>{r} км</b>\n"
         f"Период: <b>{d} дней</b>\n"
         f"Уведомления: <b>{alerts_label}</b>\n"
@@ -1318,19 +1341,27 @@ def _build_settings_content(r: int, d: int, alerts: int, season: int) -> tuple[s
     def _d(val, label):
         return f"✅ {label}" if val == d else label
 
+    # Некликабельные заголовки визуально отличаются через «── ... ──»
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Радиус поиска", callback_data="noop")],
+        # --- Местоположение ---
+        [InlineKeyboardButton(text="── 🌍 Местоположение ──", callback_data="noop")],
+        [InlineKeyboardButton(text="🏠 Ввести город",           callback_data="set_city"),
+         InlineKeyboardButton(text="📍 Геолокация (GPS)",       callback_data="set_location_request")],
+        # --- Радиус ---
+        [InlineKeyboardButton(text="── 🌐 Радиус поиска ──",    callback_data="noop")],
         [InlineKeyboardButton(text=_r(5),  callback_data="set_r:5"),
          InlineKeyboardButton(text=_r(10), callback_data="set_r:10")],
         [InlineKeyboardButton(text=_r(25), callback_data="set_r:25"),
          InlineKeyboardButton(text=_r(50), callback_data="set_r:50")],
-        [InlineKeyboardButton(text="✏️ Свой радиус", callback_data="set_r:custom")],
-        [InlineKeyboardButton(text="🕗 Период наблюдений", callback_data="noop")],
+        [InlineKeyboardButton(text="✏️ Свой радиус",             callback_data="set_r:custom")],
+        # --- Период ---
+        [InlineKeyboardButton(text="── 🕗 Период наблюдений ──", callback_data="noop")],
         [InlineKeyboardButton(text=_d(1,  "24 ч"),    callback_data="set_d:1"),
          InlineKeyboardButton(text=_d(3,  "3 дня"),   callback_data="set_d:3")],
         [InlineKeyboardButton(text=_d(7,  "7 дней"),  callback_data="set_d:7"),
          InlineKeyboardButton(text=_d(30, "30 дней"), callback_data="set_d:30")],
-        [InlineKeyboardButton(text="🔔 Уведомления и фильтры", callback_data="noop")],
+        # --- Уведомления ---
+        [InlineKeyboardButton(text="── 🗒 Уведомления и фильтры ──", callback_data="noop")],
         [InlineKeyboardButton(
             text="🔕 Выключить уведомления" if alerts else "🔔 Включить уведомления",
             callback_data="toggle_alerts",
@@ -1345,10 +1376,14 @@ def _build_settings_content(r: int, d: int, alerts: int, season: int) -> tuple[s
 @router.message(F.text == "⚙️ Настройки")
 async def settings(message: Message):
     row = await db_fetch_one(
-        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
+        "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
         (message.from_user.id,),
-    ) or (10, 7, 1, 0)
-    text, kb = _build_settings_content(*row)
+    ) or (10, 7, 1, 0, None, None)
+    r, d, alerts, season, lat, lon = row
+    location_name = ""
+    if lat is not None and lon is not None:
+        location_name = await reverse_geocode(lat, lon)
+    text, kb = _build_settings_content(r, d, alerts, season, location_name)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data == "noop")
@@ -1375,16 +1410,17 @@ async def goto_scan(callback: CallbackQuery):
 @router.callback_query(F.data == "toggle_alerts")
 async def toggle_alerts(callback: CallbackQuery):
     row     = await db_fetch_one(
-        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
+        "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
         (callback.from_user.id,),
-    ) or (10, 7, 1, 0)
-    r, d, current_alerts, season = row
+    ) or (10, 7, 1, 0, None, None)
+    r, d, current_alerts, season, lat, lon = row
     new_val = 0 if current_alerts else 1
     await db_exec(
         "UPDATE users SET alerts_enabled = ? WHERE telegram_id = ?",
         (new_val, callback.from_user.id),
     )
-    text, kb = _build_settings_content(r, d, new_val, season)
+    location_name = await reverse_geocode(lat, lon) if lat else ""
+    text, kb = _build_settings_content(r, d, new_val, season, location_name)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
@@ -1395,17 +1431,18 @@ async def toggle_alerts(callback: CallbackQuery):
 @router.callback_query(F.data == "toggle_season")
 async def toggle_season(callback: CallbackQuery):
     row = await db_fetch_one(
-        "SELECT radius, period_days, alerts_enabled, season_filter FROM users WHERE telegram_id = ?",
+        "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
         (callback.from_user.id,),
-    ) or (10, 7, 1, 0)
-    r, d, alerts, current_season = row
+    ) or (10, 7, 1, 0, None, None)
+    r, d, alerts, current_season, lat, lon = row
     new_season = 0 if current_season else 1
     await db_exec(
         "UPDATE users SET season_filter = ? WHERE telegram_id = ?",
         (new_season, callback.from_user.id),
     )
     _invalidate_scan_cache(callback.from_user.id)
-    text, kb = _build_settings_content(r, d, alerts, new_season)
+    location_name = await reverse_geocode(lat, lon) if lat else ""
+    text, kb = _build_settings_content(r, d, alerts, new_season, location_name)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
@@ -1435,12 +1472,18 @@ async def set_radius(callback: CallbackQuery, state: FSMContext):
         return
     await db_exec("UPDATE users SET radius = ? WHERE telegram_id = ?", (r, callback.from_user.id))
     _invalidate_scan_cache(callback.from_user.id)
-    await callback.message.edit_text(f"✅ Радиус обновлён: {r} км")
-    await bot.send_message(
-        callback.from_user.id, "⚙️ Настройки сохранены.",
-        reply_markup=await main_keyboard(callback.from_user.id),
-    )
-    await callback.answer()
+    row = await db_fetch_one(
+        "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
+        (callback.from_user.id,),
+    ) or (r, 7, 1, 0, None, None)
+    _r, d, alerts, season, lat, lon = row
+    location_name = await reverse_geocode(lat, lon) if lat else ""
+    text, kb = _build_settings_content(_r, d, alerts, season, location_name)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer(f"✅ Радиус: {r} км", show_alert=False)
 
 @router.message(Form.waiting_custom_radius)
 async def handle_custom_radius(message: Message, state: FSMContext):
@@ -1464,12 +1507,18 @@ async def set_days(callback: CallbackQuery):
     d = int(callback.data.split(":")[1])
     await db_exec("UPDATE users SET period_days = ? WHERE telegram_id = ?", (d, callback.from_user.id))
     _invalidate_scan_cache(callback.from_user.id)
-    await callback.message.edit_text(f"✅ Период обновлён: {d} дней")
-    await bot.send_message(
-        callback.from_user.id, "⚙️ Настройки сохранены.",
-        reply_markup=await main_keyboard(callback.from_user.id),
-    )
-    await callback.answer()
+    row = await db_fetch_one(
+        "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
+        (callback.from_user.id,),
+    ) or (10, d, 1, 0, None, None)
+    r, _d, alerts, season, lat, lon = row
+    location_name = await reverse_geocode(lat, lon) if lat else ""
+    text, kb = _build_settings_content(r, _d, alerts, season, location_name)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer(f"✅ Период: {d} дней", show_alert=False)
 
 # ================= 🚨 РЕДКИЕ ПТИЦЫ =================
 def _obs_within_hours(obs: dict, cutoff: datetime) -> bool:
@@ -1541,7 +1590,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
     sent_count = 0
     now_str    = datetime.now(timezone.utc).isoformat()
 
-    # --- iNaturalist: охраняемые виды ---
+    # --- iNaturalist: охраняемые/редкие виды ---
     taxon_count: dict[int, list] = defaultdict(list)
     for obs in observations:
         taxon_count[obs["taxon"]["id"]].append(obs)
@@ -1557,17 +1606,39 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         if dist > radius:
             continue
 
+        # --- Проверка редкости (одинакова для ручного и авто режимов) ---
+        taxon_inline = obs.get("taxon", {})
+        cs           = (taxon_inline.get("conservation_status") or {})
+        status_code  = cs.get("status", "").lower()
+        is_threatened = status_code in ("cr", "en", "vu") or bool(taxon_inline.get("threatened"))
+        global_count  = taxon_inline.get("observations_count", 0)
+
+        # Правило: не показываем глобально массовые виды (воробьи, голуби и т.п.),
+        # если только они не охраняемые — тогда показываем всегда.
+        if not is_threatened and global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
+            continue
+
         if not manual:
-            taxon_data = _get_taxon_cached(tid)
-            if taxon_data and taxon_data.get("results"):
-                cs     = (taxon_data["results"][0].get("conservation_status") or {})
-                status = cs.get("status", "").lower()
-                if status not in ("cr", "en", "vu"):
+            # В авто-режиме — только строго охраняемые (CR/EN/VU), чтобы не спамить
+            taxon_cached = _get_taxon_cached(tid)
+            if taxon_cached and taxon_cached.get("results"):
+                cs_cached = (taxon_cached["results"][0].get("conservation_status") or {})
+                if cs_cached.get("status", "").lower() not in ("cr", "en", "vu"):
                     continue
             else:
-                continue
+                # Нет данных в кэше — используем inline-данные из наблюдения
+                if not is_threatened:
+                    continue
             if tid in recent_notified:
                 continue
+
+        # Определяем метку редкости для отображения
+        if is_threatened:
+            rarity_label = "охраняемый вид (CR/EN/VU)"
+        elif global_count <= RARITY_LOCAL_RARE_THRESHOLD:
+            rarity_label = "очень редко встречается"
+        else:
+            rarity_label = "редко встречается в этом районе"
 
         found_any = True
         name  = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
@@ -1577,7 +1648,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         text  = (
             f"🚨 <b>Редкое наблюдение рядом!</b>\n\n"
             f"<b>{e(name)}</b>\n📍 {dist} км от вас\n🕒 {ago}\n"
-            f"<i>Источник: iNaturalist (охраняемый вид)</i>"
+            f"<i>🔴 {e(rarity_label)} · iNaturalist</i>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
