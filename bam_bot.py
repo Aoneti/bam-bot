@@ -43,7 +43,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 if not TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана!")
 
-EBIRD_API_KEY = os.environ.get("EBIRD_API_KEY", "")  # необязательный, но желательный
+EBIRD_API_KEY = os.environ.get("EBIRD_API_KEY", "")  # необязательный
 
 API_BASE    = "https://api.inaturalist.org/v1"
 EBIRD_BASE  = "https://api.ebird.org/v2"
@@ -54,7 +54,6 @@ SCAN_CACHE_TTL        = 240
 OBS_CACHE_TTL         = 900
 TAXON_CACHE_TTL       = 6 * 3600
 HIST_CACHE_TTL        = 24 * 3600
-HOTSPOT_CACHE_TTL     = 3600        # 1 час
 EBIRD_NOTABLE_TTL     = 1800        # 30 минут
 SCHEDULER_BATCH_SIZE  = 20
 SCHEDULER_BATCH_DELAY = 0.5
@@ -121,7 +120,6 @@ _geocode_cache     = LRUCache(max_size=200)
 _taxa_search_cache = LRUCache(max_size=100)
 _taxon_cache_lru   = LRUCache(max_size=500)
 _hist_cache_lru    = LRUCache(max_size=500)
-_hotspot_cache     = LRUCache(max_size=200)
 _ebird_notable_cache = LRUCache(max_size=200)
 
 # ================= КЭШ СКАНИРОВАНИЯ =================
@@ -252,7 +250,6 @@ async def init_db():
                 PRIMARY KEY (telegram_id, taxon_id)
             )
         """)
-        # Миграции — не падаем если колонка уже есть
         for migration in [
             "ALTER TABLE favorites ADD COLUMN last_notified_at TEXT",
             "ALTER TABLE users ADD COLUMN season_filter INTEGER DEFAULT 0",
@@ -436,21 +433,6 @@ async def get_ebird_notable(lat: float, lon: float, dist: int = 25, back: int = 
     _ebird_notable_cache.set(key, (time(), results))
     return results
 
-async def get_ebird_hotspots(lat: float, lon: float, dist: int = 25) -> list:
-    """Ближайшие eBird-хотспоты с числом видов."""
-    key   = (round(lat, 2), round(lon, 2), dist)
-    entry = _hotspot_cache.get(key)
-    if entry and (time() - entry[0]) < HOTSPOT_CACHE_TTL:
-        return entry[1]
-    results = await _ebird_get("/ref/hotspot/geo", {
-        "lat": round(lat, 4), "lng": round(lon, 4),
-        "dist": min(dist, 50), "back": 30, "fmt": "json",
-    })
-    # Сортируем по числу видов (всего за всё время)
-    results = sorted(results, key=lambda h: h.get("numSpeciesAllTime", 0), reverse=True)[:10]
-    _hotspot_cache.set(key, (time(), results))
-    return results
-
 # ================= iNATURALIST API =================
 async def get_species_counts(lat, lon, radius, days, page=1, season_filter: bool = False):
     d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
@@ -535,31 +517,54 @@ async def get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids: li
     return latest
 
 # ================= ОПРЕДЕЛЕНИЕ ПТИЦЫ ПО ФОТО =================
+_BIRD_ICONIC_NAMES = {"Aves"}
+
 async def identify_bird_photo(photo_bytes: bytes, lat: float = None, lon: float = None) -> list:
-    """Отправляет фото в iNaturalist CV API, возвращает топ результатов (только птицы)."""
+    """Отправляет фото в iNaturalist CV API.
+    Поле называется 'image' (не 'file') — ключевое отличие от обычного upload.
+    Возвращает топ-5 результатов; птиц выбираем по iconic_taxon_name или ancestor_ids.
+    """
     try:
         form = aiohttp.FormData()
-        form.add_field("file", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
+        # iNaturalist CV API принимает поле "image"
+        form.add_field("image", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
         if lat is not None and lon is not None:
-            form.add_field("lat", str(round(lat, 2)))
-            form.add_field("lng", str(round(lon, 2)))
+            form.add_field("lat", str(round(lat, 4)))
+            form.add_field("lng", str(round(lon, 4)))
+
         async with _api_semaphore:
             async with http_session.post(
                 f"{API_BASE}/computervision/score_image",
                 data=form,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=40),
             ) as r:
-                r.raise_for_status()
-                data = await r.json()
-        # Фильтруем только птиц (iconic_taxon_name == "Aves" или parent Aves)
-        results = []
-        for item in data.get("results", []):
+                body = await r.text()
+                if r.status != 200:
+                    logger.error(f"CV API HTTP {r.status}: {body[:300]}")
+                    return []
+                data = await r.json(content_type=None)
+
+        all_results = data.get("results", [])
+        logger.info(f"CV API returned {len(all_results)} results")
+
+        # iNaturalist CV API возвращает Aves через iconic_taxon_name ИЛИ
+        # через наличие taxon_id=3 (Aves) в ancestor_ids.
+        # Если поле вовсе отсутствует — возвращаем результат как есть
+        birds = []
+        other = []
+        for item in all_results:
             t = item.get("taxon", {})
-            if t.get("iconic_taxon_name") == "Aves":
-                results.append(item)
-            if len(results) >= 5:
-                break
-        return results
+            iconic = t.get("iconic_taxon_name", "")
+            ancestors = t.get("ancestor_ids", [])
+            if iconic in _BIRD_ICONIC_NAMES or 3 in ancestors:
+                birds.append(item)
+            else:
+                other.append(item)
+
+        # Если фильтр нашёл птиц — возвращаем их; иначе возвращаем всё (API сам знает)
+        result = birds if birds else all_results
+        return result[:5]
+
     except Exception as ex:
         logger.error(f"CV API error: {ex}", exc_info=True)
         return []
@@ -591,8 +596,24 @@ def _extract_taxon_flags(taxon_data: dict) -> list[str]:
         flags.append("🌍 Интродуцированный вид")
     if t.get("endemic"):
         flags.append("📌 Эндемик")
-    # conservation_status уже используется в редкости — здесь не дублируем
     return flags
+
+# Расшифровка кодов охранного статуса IUCN на русском
+_IUCN_STATUS_LABELS: dict[str, str] = {
+    "cr": "CR — на грани исчезновения",
+    "en": "EN — исчезающий вид",
+    "vu": "VU — уязвимый вид",
+    "nt": "NT — близкий к уязвимому",
+    "lc": "LC — вне угрозы",
+    "dd": "DD — недостаточно данных",
+    "ex": "EX — вымерший",
+    "ew": "EW — вымерший в дикой природе",
+}
+
+def _conservation_label(cs: dict) -> str:
+    """Возвращает строку вида 'CR — на грани исчезновения' из dict conservation_status."""
+    code = cs.get("status", "").lower()
+    return _IUCN_STATUS_LABELS.get(code, code.upper() if code else "")
 
 # ================= РЕДКОСТЬ И СЕЗОННОСТЬ =================
 async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int):
@@ -636,14 +657,17 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
 
     is_threatened = False
     global_count  = 0
+    cs_dict       = {}
     if taxon_data and taxon_data.get("results"):
         t             = taxon_data["results"][0]
-        cs            = (t.get("conservation_status") or {})
-        is_threatened = cs.get("status", "").lower() in ("cr", "en", "vu")
+        cs_dict       = (t.get("conservation_status") or {})
+        is_threatened = cs_dict.get("status", "").lower() in ("cr", "en", "vu")
         global_count  = t.get("observations_count", 0)
 
     if is_threatened:
-        rare_emoji, rare_label = "🔴", "охраняемый вид"
+        status_label   = _conservation_label(cs_dict)
+        rare_emoji     = "🔴"
+        rare_label     = f"Охраняемый вид · {status_label}" if status_label else "Охраняемый вид"
     elif global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
         rare_emoji, rare_label = "🟢", "обычная редкость"
     elif local_count <= RARITY_LOCAL_RARE_THRESHOLD:
@@ -712,15 +736,11 @@ async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         _fav_count_cache[user_id] = rows[0][0] if rows else 0
     fav_count = _fav_count_cache[user_id]
     fav_label = f"⭐ Вишлист ({fav_count})" if fav_count else "⭐ Вишлист"
-    ebird_ok  = bool(EBIRD_API_KEY)
     kb = [
         [KeyboardButton(text="🐦 Сканировать"), KeyboardButton(text="📷 Определить птицу")],
         [KeyboardButton(text="🚨 Редкие птицы"), KeyboardButton(text=fav_label)],
+        [KeyboardButton(text="⚙️ Настройки")],
     ]
-    if ebird_ok:
-        kb.append([KeyboardButton(text="🗺 Хотспоты рядом"), KeyboardButton(text="⚙️ Настройки")])
-    else:
-        kb.append([KeyboardButton(text="⚙️ Настройки")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # Временная клавиатура для запроса геолокации из настроек
@@ -774,14 +794,12 @@ async def cancel(message: Message, state: FSMContext):
 
 @router.message(Command("help"))
 async def help_cmd(message: Message):
-    ebird_text = "\n🗺 Хотспоты рядом — лучшие места для наблюдения птиц поблизости" if EBIRD_API_KEY else ""
     await message.answer(
         "🐦 <b>BAM – Birds Around Me</b>\n\n"
         "<b>Кнопки:</b>\n"
         "🐦 Сканировать — список птиц в радиусе\n"
         "📷 Определить птицу — пришлите фото, бот определит вид\n"
-        "🚨 Редкие птицы — охраняемые и необычные виды рядом"
-        + ebird_text + "\n"
+        "🚨 Редкие птицы — охраняемые и необычные виды рядом\n"
         "⭐ Вишлист — уведомления об избранных птицах\n"
         "⚙️ Настройки — радиус, период, местоположение, фильтры\n\n"
         "<b>Inline-режим:</b>\n"
@@ -1259,67 +1277,6 @@ def _replace_fav_button(markup: InlineKeyboardMarkup | None,
         new_rows.append(new_row)
     return InlineKeyboardMarkup(inline_keyboard=new_rows)
 
-# ================= 🗺 ХОТСПОТЫ =================
-@router.message(F.text == "🗺 Хотспоты рядом")
-async def show_hotspots(message: Message):
-    if not message.from_user:
-        return
-    if not EBIRD_API_KEY:
-        await message.answer("❌ Функция недоступна: не задан EBIRD_API_KEY.")
-        return
-
-    row = await db_fetch_one(
-        "SELECT lat, lon, radius FROM users WHERE telegram_id = ?",
-        (message.from_user.id,)
-    )
-    if not row or not row[0]:
-        await message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
-        return
-
-    lat, lon, radius = row
-    wait_msg = await message.answer("🗺 Ищу лучшие места для наблюдений...")
-
-    hotspots = await get_ebird_hotspots(lat, lon, dist=min(radius, 50))
-    await wait_msg.delete()
-
-    if not hotspots:
-        await message.answer(
-            "😕 Поблизости не найдено eBird-хотспотов.\n"
-            "Попробуйте увеличить радиус в ⚙️ Настройках."
-        )
-        return
-
-    text = "🗺 <b>Лучшие места для наблюдения птиц рядом</b>\n"
-    text += f"<i>Данные eBird · Радиус ~{min(radius, 50)} км</i>\n\n"
-
-    kb_rows = []
-    for i, hs in enumerate(hotspots[:8], 1):
-        name        = hs.get("locName", "Неизвестное место")
-        species_all = hs.get("numSpeciesAllTime", 0)
-        last_obs    = hs.get("latestObsDt", "")
-        hs_lat      = hs.get("lat")
-        hs_lon      = hs.get("lng")
-        dist_str    = ""
-        if hs_lat and hs_lon:
-            dist = haversine(lat, lon, hs_lat, hs_lon)
-            dist_str = f" · {dist} км"
-
-        text += f"<b>{i}. {e(name)}</b>\n"
-        text += f"🐦 {species_all} видов всего{dist_str}\n"
-        if last_obs:
-            text += f"🕒 Последнее наблюдение: {last_obs[:10]}\n"
-        text += "\n"
-
-        loc_id = hs.get("locId", "")
-        if loc_id:
-            kb_rows.append([InlineKeyboardButton(
-                text=f"📍 {name[:40]}",
-                url=f"https://ebird.org/hotspot/{loc_id}",
-            )])
-
-    await message.answer(text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None)
-
 # ================= НАСТРОЙКИ =================
 def _build_settings_content(r: int, d: int, alerts: int, season: int,
                              location_name: str = "") -> tuple[str, InlineKeyboardMarkup]:
@@ -1346,7 +1303,7 @@ def _build_settings_content(r: int, d: int, alerts: int, season: int,
         # --- Местоположение ---
         [InlineKeyboardButton(text="── 🌍 Местоположение ──", callback_data="noop")],
         [InlineKeyboardButton(text="🏠 Ввести город",           callback_data="set_city"),
-         InlineKeyboardButton(text="📍 Геолокация (GPS)",       callback_data="set_location_request")],
+         InlineKeyboardButton(text="📍 Геолокация",       callback_data="set_location_request")],
         # --- Радиус ---
         [InlineKeyboardButton(text="── 🌐 Радиус поиска ──",    callback_data="noop")],
         [InlineKeyboardButton(text=_r(5),  callback_data="set_r:5"),
@@ -1456,7 +1413,7 @@ async def set_radius(callback: CallbackQuery, state: FSMContext):
     if value == "custom":
         await state.set_state(Form.waiting_custom_radius)
         await callback.message.answer(
-            "✏️ Введите радиус в километрах (1–200):\n\nНапример: <b>35</b>\n\nИли /cancel",
+            "✏️ Введите радиус в километрах (1–200):\n\nНапример: <b>42</b>\n\nИли /cancel",
             parse_mode="HTML",
         )
         await callback.answer()
@@ -1549,7 +1506,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
 
     lat, lon, radius, days = row
 
-    # iNaturalist наблюдения
+    # iNaturalist-наблюдения
     if manual:
         if observations is None:
             observations = await get_recent_observations(lat, lon, radius, days)
@@ -1566,7 +1523,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
             cutoff       = datetime.now(timezone.utc) - timedelta(hours=AUTO_CHECK_WINDOW_HOURS)
             observations = [obs for obs in observations if _obs_within_hours(obs, cutoff)]
 
-    # eBird notable birds (только при ручном запросе или авто с ключом)
+    # eBird notable birds
     ebird_notables = []
     if EBIRD_API_KEY:
         ebird_notables = await get_ebird_notable(lat, lon, dist=min(radius, 50))
@@ -1613,20 +1570,18 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         is_threatened = status_code in ("cr", "en", "vu") or bool(taxon_inline.get("threatened"))
         global_count  = taxon_inline.get("observations_count", 0)
 
-        # Правило: не показываем глобально массовые виды (воробьи, голуби и т.п.),
-        # если только они не охраняемые — тогда показываем всегда.
+        # Правило: не показываем глобально массовые виды,
+        # если только они не охраняемые
         if not is_threatened and global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
             continue
 
         if not manual:
-            # В авто-режиме — только строго охраняемые (CR/EN/VU), чтобы не спамить
             taxon_cached = _get_taxon_cached(tid)
             if taxon_cached and taxon_cached.get("results"):
                 cs_cached = (taxon_cached["results"][0].get("conservation_status") or {})
                 if cs_cached.get("status", "").lower() not in ("cr", "en", "vu"):
                     continue
             else:
-                # Нет данных в кэше — используем inline-данные из наблюдения
                 if not is_threatened:
                     continue
             if tid in recent_notified:
@@ -1634,27 +1589,44 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
 
         # Определяем метку редкости для отображения
         if is_threatened:
-            rarity_label = "охраняемый вид (CR/EN/VU)"
+            cs_inline = (obs.get("taxon", {}).get("conservation_status") or {})
+            status_lbl = _conservation_label(cs_inline)
+            rarity_line = f"🔴 Охраняемый вид · {status_lbl}" if status_lbl else "🔴 Охраняемый вид"
         elif global_count <= RARITY_LOCAL_RARE_THRESHOLD:
-            rarity_label = "очень редко встречается"
+            rarity_line = "🔴 Очень редко встречается"
         else:
-            rarity_label = "редко встречается в этом районе"
+            rarity_line = "🟡 Редко встречается в этом районе"
 
         found_any = True
-        name  = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
-        ago   = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
-        photo = get_photo_url(obs, "medium")
-        url   = f"https://www.inaturalist.org/observations/{obs['id']}"
-        text  = (
-            f"🚨 <b>Редкое наблюдение рядом!</b>\n\n"
-            f"<b>{e(name)}</b>\n📍 {dist} км от вас\n🕒 {ago}\n"
-            f"<i>🔴 {e(rarity_label)} · iNaturalist</i>"
+        taxon_obj = obs["taxon"]
+        name      = taxon_obj.get("preferred_common_name") or taxon_obj["name"]
+        sci       = taxon_obj.get("name", "")
+        ago       = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
+        photo_med = get_photo_url(obs, "medium")
+        photo_ori = get_photo_url(obs, "original")
+        url       = f"https://www.inaturalist.org/observations/{obs['id']}"
+
+        # Таксономия из inline-данных наблюдения
+        taxon_cached_data = _get_taxon_cached(tid)
+        family_name, order_name = _extract_taxonomy(taxon_cached_data) if taxon_cached_data else ("", "")
+        taxonomy_str = ""
+        if order_name or family_name:
+            taxonomy_str = "🔬 " + " · ".join(filter(None, [e(order_name), e(family_name)])) + "\n"
+
+        text = (
+            f"🚨 <b>{e(name)}</b>  <i>{e(sci)}</i>\n"
+            f"{taxonomy_str}"
+            f"\n{rarity_line}\n"
+            f"📍 {dist} км от вас\n"
+            f"🕒 {ago}\n"
+            f"\n<i>Редкое наблюдение рядом · iNaturalist</i>"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
-        ]])
-        if photo:
-            await bot.send_photo(telegram_id, photo, caption=text,
+        kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)]]
+        if photo_ori:
+            kb_rows.append([InlineKeyboardButton(text="🔍 Фото в полном размере", url=photo_ori)])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        if photo_med:
+            await bot.send_photo(telegram_id, photo_med, caption=text,
                                  reply_markup=kb, parse_mode="HTML")
         else:
             await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
@@ -1697,21 +1669,22 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
                     continue
                 dist_str = f"📍 {dist_nb} км от вас\n"
 
-            obs_dt  = notable.get("obsDt", "")[:10]
+            obs_dt   = notable.get("obsDt", "")[:10]
             how_many = notable.get("howMany")
-            count_str = f" ({how_many} особ.)" if how_many else ""
+            count_str = f" · {how_many} особ." if how_many else ""
+            loc_name  = notable.get("locName", "")
 
-            loc_name = notable.get("locName", "")
             text = (
-                f"🚨 <b>Необычное наблюдение рядом!</b>\n\n"
-                f"<b>{e(com_name)}</b> <i>{e(sci_name)}</i>{count_str}\n"
+                f"🚨 <b>{e(com_name)}</b>  <i>{e(sci_name)}</i>\n"
+                f"\n🟡 Необычный вид для этого района{count_str}\n"
                 f"{dist_str}"
-                f"📅 {obs_dt}\n"
-                f"📍 {e(loc_name)}\n"
-                f"<i>Источник: eBird (необычный вид для этого района)</i>"
+                f"🕒 {obs_dt}\n"
+                f"📌 {e(loc_name)}\n"
+                f"\n<i>Необычное наблюдение рядом · eBird</i>"
             )
             loc_id = notable.get("locId", "")
-            url    = f"https://ebird.org/hotspot/{loc_id}" if loc_id else "https://ebird.org"
+            url    = f"https://ebird.org/checklist/{notable.get('subId', '')}" if notable.get("subId") else \
+                     (f"https://ebird.org/hotspot/{loc_id}" if loc_id else "https://ebird.org")
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Открыть на eBird →", url=url)
             ]])
@@ -1766,19 +1739,37 @@ async def check_watchlist_for_user(telegram_id: int, observations: list | None =
         if obs_lat is None:
             continue
 
-        dist  = haversine(lat, lon, obs_lat, obs_lon)
-        ago   = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
-        photo = get_photo_url(obs, "medium")
-        url   = f"https://www.inaturalist.org/observations/{obs['id']}"
-        text  = (
-            f"⭐ <b>Птица из вишлиста замечена рядом!</b>\n\n"
-            f"<b>{e(taxon_name)}</b>\n📍 {dist} км от вас\n🕒 {ago}"
+        dist      = haversine(lat, lon, obs_lat, obs_lon)
+        ago       = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
+        photo_med = get_photo_url(obs, "medium")
+        photo_ori = get_photo_url(obs, "original")
+        url       = f"https://www.inaturalist.org/observations/{obs['id']}"
+
+        # Таксономия из кэша
+        taxon_cached_data = _get_taxon_cached(taxon_id)
+        family_name, order_name = _extract_taxonomy(taxon_cached_data) if taxon_cached_data else ("", "")
+        taxonomy_str = ""
+        if order_name or family_name:
+            taxonomy_str = "🔬 " + " · ".join(filter(None, [e(order_name), e(family_name)])) + "\n"
+
+        sci = ""
+        if obs.get("taxon", {}).get("name"):
+            sci = obs["taxon"]["name"]
+
+        text = (
+            f"⭐ <b>{e(taxon_name)}</b>  <i>{e(sci)}</i>\n"
+            f"{taxonomy_str}"
+            f"\n⭐ Из вашего вишлиста\n"
+            f"📍 {dist} км от вас\n"
+            f"🕒 {ago}\n"
+            f"\n<i>Птица из вишлиста замечена рядом · iNaturalist</i>"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)
-        ]])
-        if photo:
-            await bot.send_photo(telegram_id, photo, caption=text,
+        kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)]]
+        if photo_ori:
+            kb_rows.append([InlineKeyboardButton(text="🔍 Фото в полном размере", url=photo_ori)])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        if photo_med:
+            await bot.send_photo(telegram_id, photo_med, caption=text,
                                  reply_markup=kb, parse_mode="HTML")
         else:
             await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
@@ -1818,18 +1809,40 @@ async def check_bird_alert_for_user(telegram_id: int, lat: float, lon: float,
         if absent_days is None or absent_days >= BIRD_ALERT_DAYS:
             if alerts_sent < 3:
                 months_absent = (absent_days // 30) if absent_days else None
-                name  = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
-                ago   = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
-                photo = get_photo_url(obs, "medium")
-                url   = f"https://www.inaturalist.org/observations/{obs['id']}"
-                header = (f"🔥 <b>впервые за {months_absent} мес. в вашем районе замечен:</b>"
-                          if months_absent else "🔥 <b>впервые замечен в вашем районе:</b>")
-                text  = f"{header}\n\n<b>{e(name)}</b>\n📍 Радиус: {radius} км\n🕒 {ago}"
-                kb    = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Открыть наблюдение →", url=url)
-                ]])
-                if photo:
-                    await bot.send_photo(telegram_id, photo, caption=text,
+                taxon_obj = obs["taxon"]
+                name      = taxon_obj.get("preferred_common_name") or taxon_obj["name"]
+                sci       = taxon_obj.get("name", "")
+                ago       = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
+                photo_med = get_photo_url(obs, "medium")
+                photo_ori = get_photo_url(obs, "original")
+                url       = f"https://www.inaturalist.org/observations/{obs['id']}"
+                obs_lat, obs_lon = _parse_obs_coords(obs)
+                dist_str  = (f"📍 {haversine(lat, lon, obs_lat, obs_lon)} км от вас\n"
+                             if obs_lat is not None else "")
+
+                # Таксономия из кэша
+                taxon_cached_data = _get_taxon_cached(tid)
+                family_name, order_name = _extract_taxonomy(taxon_cached_data) if taxon_cached_data else ("", "")
+                taxonomy_str = ""
+                if order_name or family_name:
+                    taxonomy_str = "🔬 " + " · ".join(filter(None, [e(order_name), e(family_name)])) + "\n"
+
+                absent_note = (f"не наблюдался {months_absent} мес." if months_absent
+                               else "ранее не наблюдался")
+                text = (
+                    f"🔥 <b>{e(name)}</b>  <i>{e(sci)}</i>\n"
+                    f"{taxonomy_str}"
+                    f"\n🔥 Впервые в вашем районе ({absent_note})\n"
+                    f"{dist_str}"
+                    f"🕒 {ago}\n"
+                    f"\n<i>Bird Alert · iNaturalist</i>"
+                )
+                kb_rows = [[InlineKeyboardButton(text="Открыть на iNaturalist →", url=url)]]
+                if photo_ori:
+                    kb_rows.append([InlineKeyboardButton(text="🔍 Фото в полном размере", url=photo_ori)])
+                kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+                if photo_med:
+                    await bot.send_photo(telegram_id, photo_med, caption=text,
                                          reply_markup=kb, parse_mode="HTML")
                 else:
                     await bot.send_message(telegram_id, text, reply_markup=kb, parse_mode="HTML")
