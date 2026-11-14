@@ -3,7 +3,7 @@
 **Бот для отслеживания птиц рядом с вами → https://t.me/birdsaroundmebot**  
 Работает на данных **iNaturalist** и **eBird (Cornell Lab)**. Показывает, кто летает вокруг, определяет птицу по фото, уведомляет о редких видах и птицах из вишлиста.
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-orange.svg)](https://docs.aiogram.dev)
 [![iNaturalist](https://img.shields.io/badge/API-iNaturalist-green.svg)](https://api.inaturalist.org)
 [![eBird](https://img.shields.io/badge/API-eBird-teal.svg)](https://documenter.getpostman.com/view/664302/S1ENwy59)
@@ -45,4 +45,4 @@
 
 ---
 
-**Версия: 1.3 (April 2026)**
+**Версия: 1.3.1 (14 November 2026)**
