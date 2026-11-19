@@ -7,6 +7,9 @@ import json
 import math
 import logging
 import os
+import re
+import zlib
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 load_dotenv()
 import uuid
@@ -16,7 +19,7 @@ from time import time
 
 import aiohttp
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
@@ -30,14 +33,27 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    InlineQueryResultsButton,
     ErrorEvent,
 )
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Bot API 10.1+ (Rich Messages) и 10.4 (HTML Widgets) есть в aiogram >= 3.32.
+# На более старой версии библиотеки эти возможности автоматически отключаются,
+# а остальные функции бота продолжают работать как раньше.
+try:
+    from aiogram.types import InputRichMessage
+except ImportError:
+    InputRichMessage = None
+try:
+    from aiogram.types import WidgetQuery
+except ImportError:
+    WidgetQuery = None
 
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -46,17 +62,39 @@ if not TOKEN:
 
 EBIRD_API_KEY = os.environ.get("EBIRD_API_KEY", "")  # необязательный
 
+# iNaturalist: авторизация нужна только для Computer Vision (определение птицы по фото).
+# OAuth2 Password Grant -> OAuth access token -> JWT -> заголовок Authorization.
+INAT_USERNAME   = os.environ.get("INAT_USERNAME", "")
+INAT_PASSWORD   = os.environ.get("INAT_PASSWORD", "")
+INAT_APP_ID     = os.environ.get("INAT_APP_ID", "")
+INAT_APP_SECRET = os.environ.get("INAT_APP_SECRET", "")
+
+INAT_WWW_BASE = "https://www.inaturalist.org"
+_inat_oauth_token: str = ""
+_inat_jwt: str = ""
+_inat_jwt_exp: float = 0.0
+_inat_auth_lock: asyncio.Lock = asyncio.Lock()
+_inat_auth_retry_after: float = 0.0   # короткая пауза после неудачной авторизации
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Необязательный переключатель из .env: 0/false/no/off выключает, пустое значение = default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
 # ================= ЛОГИРОВАНИЕ И ЗАЩИТА СЕКРЕТОВ =================
 def _redact_secrets_in_text(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
-    for secret in (TOKEN, EBIRD_API_KEY):
+    # Кортеж собирается при каждом вызове, чтобы скрывать и динамические OAuth/JWT-токены.
+    for secret in (TOKEN, EBIRD_API_KEY, INAT_PASSWORD, INAT_APP_SECRET, _inat_oauth_token, _inat_jwt):
         if secret and secret in text:
             text = text.replace(secret, "***REDACTED***")
     return text
 
 class _SecretRedactingFilter(logging.Filter):
-    """Очищает record.msg, record.args и record.exc_text от BOT_TOKEN и EBIRD_API_KEY."""
+    """Очищает record.msg, record.args и record.exc_text от BOT_TOKEN, EBIRD_API_KEY, INAT_* и OAuth/JWT-токенов."""
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
             record.msg = _redact_secrets_in_text(record.msg)
@@ -95,7 +133,12 @@ _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(_log_formatter)
 _stream_handler.addFilter(_secret_filter)
 
-_file_handler = logging.FileHandler("bam_bot.log", encoding="utf-8")
+_file_handler = RotatingFileHandler(
+    "bam_bot.log",
+    maxBytes=5_000_000,
+    backupCount=3,
+    encoding="utf-8",
+)
 _file_handler.setFormatter(_log_formatter)
 _file_handler.addFilter(_secret_filter)
 
@@ -128,17 +171,40 @@ NOMINATIM_MIN_INTERVAL  = 1.1
 AUTO_CHECK_WINDOW_HOURS = 3
 LOCATION_RESET_DIST_KM  = 5.0
 
+BOT_VERSION              = "1.4.0"
+PHOTO_COOLDOWN_SEC       = 10          # интервал между распознаваниями фото от одного пользователя
+RARE_MANUAL_COOLDOWN_SEC = 30          # интервал между ручными проверками редких птиц
+MAX_PHOTO_BYTES          = 10 * 1024 * 1024
+MAX_FAVORITES            = 100         # лимит вишлиста (кнопки/размер сообщения Telegram)
+SMALL_RADIUS_KM          = 5           # до этого радиуса координаты округляются до 3 знаков
+OBS_QUALITY_GRADES       = "research,needs_id"  # вишлист и inline: без casual, но и без ожидания подтверждения
+RICH_FAIL_LIMIT          = 5           # подряд ошибок формата Rich Message до временного отключения
+RICH_DISABLE_SEC         = 1800
+
 RARITY_GLOBAL_COMMON_THRESHOLD  = 10_000
 RARITY_LOCAL_RARE_THRESHOLD     = 5
 RARITY_LOCAL_UNCOMMON_THRESHOLD = 20
-
-CURRENT_MONTH = datetime.now(timezone.utc).month
 
 bot     = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp      = Dispatcher(storage=storage)
 router  = Router()
 dp.include_router(router)
+
+# Переключатели новых возможностей Telegram (BAM_RICH_MESSAGES=0 / BAM_WIDGETS=0 в .env выключают их).
+RICH_MESSAGES_ENABLED: bool = (
+    _env_flag("BAM_RICH_MESSAGES", True)
+    and InputRichMessage is not None
+    and hasattr(Bot, "send_rich_message")
+)
+WIDGETS_ENABLED: bool = (
+    _env_flag("BAM_WIDGETS", True)
+    and WidgetQuery is not None
+    and all(hasattr(Bot, n) for n in ("send_widget", "answer_widget_query", "edit_message_widget_data"))
+    and hasattr(router, "widget_query")
+)
+_rich_fail_streak: int   = 0
+_rich_disabled_until: float = 0.0
 
 BOT_USERNAME: str                       = ""
 _api_semaphore: asyncio.Semaphore       = None
@@ -157,12 +223,13 @@ class Form(StatesGroup):
 _scan_cooldown:    dict[int, float]   = {}
 _fav_cooldown:     dict[tuple, float] = {}
 _geocode_cooldown: dict[int, float]   = {}
+_photo_cooldown:   dict[int, float]   = {}
+_rare_cooldown:    dict[int, float]   = {}
 
 # ================= КЭШ ВИШЛИСТА =================
-_fav_count_cache: dict[int, int] = {}
-
+# (сам кэш _fav_count_cache создаётся ниже, после класса LRUCache)
 def _invalidate_fav_count(user_id: int):
-    _fav_count_cache.pop(user_id, None)
+    _fav_count_cache.pop(user_id)
 
 # ================= ГЛОБАЛЬНЫЕ =================
 http_session: aiohttp.ClientSession = None
@@ -187,12 +254,17 @@ class LRUCache:
         if len(self._cache) > self._max:
             self._cache.popitem(last=False)
 
+    def pop(self, key, default=None):
+        return self._cache.pop(key, default)
+
 _geocode_cache         = LRUCache(max_size=200)
 _reverse_geocode_cache = LRUCache(max_size=500)
 _taxa_search_cache     = LRUCache(max_size=100)
 _taxon_cache_lru       = LRUCache(max_size=500)
 _hist_cache_lru        = LRUCache(max_size=500)
 _ebird_notable_cache   = LRUCache(max_size=200)
+_fav_count_cache       = LRUCache(max_size=5000)   # user_id -> число птиц в вишлисте
+_bird_facts_cache      = LRUCache(max_size=300)    # (user_id, taxon_id) -> сведения для виджета
 
 # ================= КЭШ СКАНИРОВАНИЯ =================
 _scan_cache:       LRUCache                  = LRUCache(max_size=1000)
@@ -218,11 +290,37 @@ def _invalidate_scan_cache(user_id: int):
         del _scan_cache._cache[k]
     _scan_total_pages.pop(user_id, None)
 
+# ================= КООРДИНАТЫ И ДАТЫ ДЛЯ ЗАПРОСОВ =================
+def _q_coord(value: float, radius) -> float:
+    """Округление координаты для запроса и ключа кэша.
+    До SMALL_RADIUS_KM км - 3 знака (~110 м), иначе 2 знака (~1.1 км): так общий кэш
+    для соседей сохраняется на больших радиусах, а на малых нет сдвига центра поиска."""
+    try:
+        precise = float(radius) <= SMALL_RADIUS_KM
+    except (TypeError, ValueError):
+        precise = False
+    return round(value, 3 if precise else 2)
+
+def _utc_date_str(days_back: int = 0) -> str:
+    """Дата (UTC) за days_back дней до сегодня в формате YYYY-MM-DD для параметров iNaturalist."""
+    return (datetime.now(timezone.utc).date() - timedelta(days=days_back)).isoformat()
+
+def _window_months(days: int) -> str:
+    """Месяцы (1-12), затронутые окном [сегодня - days, сегодня] по UTC, через запятую: '11,12'.
+    Нужен сезонному фильтру, чтобы параметр month не отрезал наблюдения прошлого месяца."""
+    today = datetime.now(timezone.utc).date()
+    months: list[int] = []
+    for back in range(max(int(days), 0), -1, -1):
+        m = (today - timedelta(days=back)).month
+        if m not in months:
+            months.append(m)
+    return ",".join(str(m) for m in months)
+
 # ================= ОБЩИЙ КЭШ НАБЛЮДЕНИЙ =================
 _obs_cache: LRUCache = LRUCache(max_size=500)
 
 def _coord_key(lat: float, lon: float, radius: int, days: int) -> tuple:
-    return (round(lat, 2), round(lon, 2), radius, days)
+    return (_q_coord(lat, radius), _q_coord(lon, radius), radius, days)
 
 def _get_obs_cache(lat: float, lon: float, radius: int, days: int):
     entry = _obs_cache.get(_coord_key(lat, lon, radius, days))
@@ -246,7 +344,7 @@ def _set_taxon_cache(taxon_id: int, data: dict):
 
 # ================= КЭШ ГИСТОГРАММ =================
 def _get_hist_cached(taxon_id: int, lat: float, lon: float, radius: int):
-    key   = (taxon_id, round(lat, 2), round(lon, 2), radius)
+    key   = (taxon_id, _q_coord(lat, radius), _q_coord(lon, radius), radius)
     entry = _hist_cache_lru.get(key)
     if entry and (time() - entry[0]) < HIST_CACHE_TTL:
         return entry[1]
@@ -254,7 +352,7 @@ def _get_hist_cached(taxon_id: int, lat: float, lon: float, radius: int):
 
 def _set_hist_cache(taxon_id: int, lat: float, lon: float, radius: int, data: dict):
     if isinstance(data, dict) and "results" in data:
-        _hist_cache_lru.set((taxon_id, round(lat, 2), round(lon, 2), radius), (time(), data))
+        _hist_cache_lru.set((taxon_id, _q_coord(lat, radius), _q_coord(lon, radius), radius), (time(), data))
 
 # ================= ОЧИСТКА =================
 def _cleanup_scan_cache():
@@ -279,6 +377,10 @@ def _cleanup_cooldowns():
         del _fav_cooldown[k]
     for k in [k for k, v in _geocode_cooldown.items() if v < threshold]:
         del _geocode_cooldown[k]
+    for k in [k for k, v in _photo_cooldown.items() if v < threshold]:
+        del _photo_cooldown[k]
+    for k in [k for k, v in _rare_cooldown.items() if v < threshold]:
+        del _rare_cooldown[k]
 
 async def _cleanup_rare_notifications():
     try:
@@ -407,7 +509,7 @@ async def db_transaction():
             if db_conn.in_transaction:
                 await db_conn.commit()
             db_conn.isolation_level = None
-        await db.execute("BEGIN IMMEDIATE") if hasattr(db_conn, "db") else await db_conn.execute("BEGIN IMMEDIATE")
+        await db_conn.execute("BEGIN IMMEDIATE")
         try:
             yield db_conn
         except BaseException:
@@ -469,7 +571,7 @@ async def _upsert_user_location(uid: int, lat: float, lon: float):
 async def _nominatim_get(url: str, params: dict, timeout_sec: float) -> list | dict | None:
     """Глобально ограниченный по частоте запрос к Nominatim (не более 1 запроса в 1.1 с)."""
     global _nominatim_last_req_ts
-    headers = {"User-Agent": "BAM-BirdsAroundMeBot/1.3.2", "Accept-Language": "ru"}
+    headers = {"User-Agent": f"BAM-BirdsAroundMeBot/{BOT_VERSION}", "Accept-Language": "ru"}
     async with _nominatim_lock:
         elapsed = time() - _nominatim_last_req_ts
         if elapsed < NOMINATIM_MIN_INTERVAL:
@@ -716,14 +818,16 @@ async def get_ebird_notable(lat: float, lon: float, dist: int = 25, back: int = 
 
 # ================= iNATURALIST API =================
 async def get_species_counts(lat, lon, radius, days, page=1, season_filter: bool = False):
-    d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
+    d1   = _utc_date_str(days)
     params = {
-        "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1,
+        "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1,
         "iconic_taxa": "Aves", "locale": "ru",
         "per_page": 10, "page": page, "order_by": "observations_count",
     }
     if season_filter:
-        params["month"] = datetime.now(timezone.utc).month
+        # Месяцы всего окна наблюдений (а не только текущий), иначе в начале месяца
+        # фильтр отрезал бы наблюдения последних дней прошлого месяца.
+        params["month"] = _window_months(days)
     data = await api_get(f"{API_BASE}/observations/species_counts", params)
     return data.get("results", []), data.get("total_results", 0)
 
@@ -731,9 +835,9 @@ async def get_recent_observations(lat, lon, radius, days) -> list:
     cached = _get_obs_cache(lat, lon, radius, days)
     if cached is not None:
         return cached
-    d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
+    d1   = _utc_date_str(days)
     data = await api_get(f"{API_BASE}/observations", {
-        "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1,
+        "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1,
         "iconic_taxa": "Aves", "locale": "ru",
         "per_page": 100, "order_by": "observed_on", "order": "desc",
     })
@@ -744,9 +848,9 @@ async def get_recent_observations(lat, lon, radius, days) -> list:
     return results
 
 async def get_latest_observation_for_taxon(lat, lon, radius, days, taxon_id):
-    d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
+    d1   = _utc_date_str(days)
     data = await api_get(f"{API_BASE}/observations", {
-        "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1,
+        "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1,
         "taxon_id": taxon_id, "per_page": 1,
         "order_by": "observed_on", "order": "desc", "locale": "ru",
     })
@@ -787,12 +891,14 @@ async def search_taxa_by_name(query: str) -> list:
 async def get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids: list) -> dict:
     if not taxon_ids:
         return {}
-    d1   = (datetime.now().date() - timedelta(days=days)).isoformat()
+    d1   = _utc_date_str(days)
     data = await api_get(f"{API_BASE}/observations", {
-        "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1,
+        "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1,
         "taxon_id": ",".join(str(t) for t in taxon_ids),
         "iconic_taxa": "Aves", "locale": "ru",
-        "per_page": 200, "quality_grade": "research",
+        # research,needs_id: вишлист не должен ждать подтверждения (README: «как только появятся рядом»),
+        # при этом casual-наблюдения исключены. Первичный проход по общему кэшу и так не фильтрует качество.
+        "per_page": 200, "quality_grade": OBS_QUALITY_GRADES,
         "order_by": "observed_on", "order": "desc",
     })
     latest: dict = {}
@@ -804,50 +910,145 @@ async def get_batch_watchlist_observations(lat, lon, radius, days, taxon_ids: li
                 latest[tid] = obs
     return latest
 
+# ================= АУТЕНТИФИКАЦИЯ iNATURALIST ДЛЯ CV API =================
+# Определение по фото (/computervision/score_image) требует авторизации. Остальные GET-запросы
+# к iNaturalist анонимные и авторизацию не используют.
+# Схема: OAuth2 Password Grant -> OAuth access token -> JWT (api_token) -> заголовок Authorization.
+async def _inat_fetch_oauth_token() -> str:
+    """Шаг 1: OAuth2 Password Grant. Возвращает access_token или пустую строку."""
+    async with http_session.post(
+        f"{INAT_WWW_BASE}/oauth/token",
+        json={
+            "client_id": INAT_APP_ID,
+            "client_secret": INAT_APP_SECRET,
+            "grant_type": "password",
+            "username": INAT_USERNAME,
+            "password": INAT_PASSWORD,
+        },
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as r:
+        body = await r.text()
+        if r.status != 200:
+            logger.error(f"iNat OAuth token HTTP {r.status}: {body[:200]}")
+            return ""
+        data = json.loads(body)
+        return str(data.get("access_token") or "") if isinstance(data, dict) else ""
+
+async def _inat_fetch_jwt(oauth_token: str) -> str:
+    """Шаг 2: обмен OAuth-токена на JWT. Возвращает api_token или пустую строку."""
+    async with http_session.get(
+        f"{INAT_WWW_BASE}/users/api_token",
+        headers={"Authorization": f"Bearer {oauth_token}"},
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as r:
+        body = await r.text()
+        if r.status != 200:
+            logger.error(f"iNat api_token HTTP {r.status}: {body[:200]}")
+            return ""
+        data = json.loads(body)
+        return str(data.get("api_token") or "") if isinstance(data, dict) else ""
+
+async def get_inat_jwt(force_refresh: bool = False) -> str:
+    """JWT для CV API. Кэшируется ~23 часа (срок жизни JWT - 24 часа).
+    Один asyncio.Lock: параллельные запросы на распознавание не получают токены одновременно."""
+    global _inat_oauth_token, _inat_jwt, _inat_jwt_exp, _inat_auth_retry_after
+    if not (INAT_USERNAME and INAT_PASSWORD and INAT_APP_ID and INAT_APP_SECRET):
+        logger.error(
+            "iNat CV: не заданы INAT_USERNAME / INAT_PASSWORD / INAT_APP_ID / INAT_APP_SECRET "
+            "в .env - определение птицы по фото недоступно."
+        )
+        return ""
+
+    async with _inat_auth_lock:
+        if not force_refresh and _inat_jwt and time() < _inat_jwt_exp:
+            return _inat_jwt
+        if time() < _inat_auth_retry_after:
+            logger.warning(
+                f"iNat CV: авторизация приостановлена после неудачи, повтор через {int(_inat_auth_retry_after - time())} с"
+            )
+            return ""
+
+        for attempt in (1, 2):
+            try:
+                oauth_token = _inat_oauth_token or await _inat_fetch_oauth_token()
+                if oauth_token:
+                    jwt_token = await _inat_fetch_jwt(oauth_token)
+                    if jwt_token:
+                        _inat_oauth_token = oauth_token
+                        _inat_jwt         = jwt_token
+                        _inat_jwt_exp     = time() + 23 * 3600
+                        return jwt_token
+            except Exception as ex:
+                logger.error(f"iNat auth: попытка {attempt}: {type(ex).__name__}: {ex}")
+            # Не удалось: сбрасываем кэш и повторяем с полным перелогином.
+            _inat_oauth_token = ""
+            _inat_jwt         = ""
+            _inat_jwt_exp     = 0.0
+
+        # Две неудачные попытки подряд: короткая пауза, чтобы неверные данные не засыпали iNaturalist логинами.
+        _inat_auth_retry_after = time() + 60
+        return ""
+
 # ================= ОПРЕДЕЛЕНИЕ ПТИЦЫ ПО ФОТО =================
 _BIRD_ICONIC_NAMES = {"Aves"}
 
 async def identify_bird_photo(photo_bytes: bytes, lat: float = None, lon: float = None) -> list:
-    """Отправляет фото в iNaturalist CV API.
-    Поле называется 'image' (не 'file') — ключевое отличие от обычного upload.
+    """Отправляет фото в iNaturalist CV API (нужна авторизация: JWT в заголовке Authorization без 'Bearer').
+    Поле называется 'image' (не 'file') - ключевое отличие от обычного upload.
     Возвращает топ-5 результатов; птиц выбираем по iconic_taxon_name или ancestor_ids.
     """
     try:
-        form = aiohttp.FormData()
-        form.add_field("image", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
-        if lat is not None and lon is not None:
-            form.add_field("lat", str(round(lat, 4)))
-            form.add_field("lng", str(round(lon, 4)))
+        jwt_token = await get_inat_jwt()
+        if not jwt_token:
+            return []
 
-        sem = _api_semaphore or asyncio.Semaphore(API_SEMAPHORE_LIMIT)
-        async with sem:
-            async with http_session.post(
-                f"{API_BASE}/computervision/score_image",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=40),
-            ) as r:
-                body = await r.text()
-                if r.status != 200:
-                    logger.error(f"CV API HTTP {r.status}: {body[:300]}")
+        for attempt in (1, 2):
+            # FormData одноразовая: на каждой попытке создаём заново.
+            form = aiohttp.FormData()
+            form.add_field("image", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
+            if lat is not None and lon is not None:
+                form.add_field("lat", str(round(lat, 4)))
+                form.add_field("lng", str(round(lon, 4)))
+
+            data = None
+            sem = _api_semaphore or asyncio.Semaphore(API_SEMAPHORE_LIMIT)
+            async with sem:
+                async with http_session.post(
+                    f"{API_BASE}/computervision/score_image",
+                    data=form,
+                    headers={"Authorization": jwt_token},
+                    timeout=aiohttp.ClientTimeout(total=40),
+                ) as r:
+                    body = await r.text()
+                    status = r.status
+                    if status == 200:
+                        data = await r.json(content_type=None)
+
+            # Семафор уже освобождён: обновление токена не занимает слот API.
+            if status == 401 and attempt == 1:
+                logger.warning("CV API HTTP 401: JWT отклонён, обновляю токен и повторяю запрос")
+                jwt_token = await get_inat_jwt(force_refresh=True)
+                if not jwt_token:
                     return []
-                data = await r.json(content_type=None)
+                continue
+            if status != 200:
+                logger.error(f"CV API HTTP {status}: {body[:300]}")
+                return []
+            break
 
-        all_results = data.get("results", [])
+        all_results = (data or {}).get("results", [])
         logger.info(f"CV API returned {len(all_results)} results")
 
         birds = []
-        other = []
         for item in all_results:
-            t = item.get("taxon", {})
-            iconic = t.get("iconic_taxon_name", "")
-            ancestors = t.get("ancestor_ids", [])
+            taxon = item.get("taxon") or {}
+            iconic = taxon.get("iconic_taxon_name", "")
+            ancestors = taxon.get("ancestor_ids") or []
             if iconic in _BIRD_ICONIC_NAMES or 3 in ancestors:
                 birds.append(item)
-            else:
-                other.append(item)
 
-        result = birds if birds else all_results
-        return result[:5]
+        # Известный риск: если среди результатов нет птиц, возвращаются все результаты (фото не птицы).
+        return (birds if birds else all_results)[:5]
 
     except Exception as ex:
         logger.error(f"CV API error: {type(ex).__name__}: {ex}", exc_info=True)
@@ -900,13 +1101,13 @@ def _conservation_label(cs: dict) -> str:
 
 # ================= РЕДКОСТЬ И СЕЗОННОСТЬ =================
 async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int):
-    d1_year = (datetime.now().date() - timedelta(days=365)).isoformat()
+    d1_year = _utc_date_str(365)
 
     taxon_cached = _get_taxon_cached(taxon_id)
     hist_cached  = _get_hist_cached(taxon_id, lat, lon, radius)
 
     yearly_task = api_get(f"{API_BASE}/observations/species_counts", {
-        "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1_year,
+        "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1_year,
         "taxon_id": taxon_id, "iconic_taxa": "Aves", "per_page": 1,
     })
     taxon_task = (
@@ -916,7 +1117,7 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
     hist_task = (
         api_get(f"{API_BASE}/observations/histogram", {
             "taxon_id": taxon_id,
-            "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius,
+            "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius,
             "date_field": "observed_on", "interval": "month_of_year",
         })
         if hist_cached is None else None
@@ -935,6 +1136,8 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
 
     # --- Редкость ---
     local_count   = 0
+    # Если запрос не удался (api_get вернул {}), локальную редкость оценивать нельзя.
+    local_known   = isinstance(yearly_data, dict) and "results" in yearly_data
     if yearly_data.get("results"):
         local_count = yearly_data["results"][0].get("count", 0)
 
@@ -951,9 +1154,12 @@ async def get_rare_and_season(taxon_id: int, lat: float, lon: float, radius: int
         status_label   = _conservation_label(cs_dict)
         rare_emoji     = "🔴"
         rare_label     = f"Охраняемый вид · {status_label}" if status_label else "Охраняемый вид"
-    elif global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
+    elif not local_known and global_count > RARITY_GLOBAL_COMMON_THRESHOLD:
+        # Нет данных по району: опираемся только на общемировую статистику.
         rare_emoji, rare_label = "🟢", "обычная редкость"
     elif local_count <= RARITY_LOCAL_RARE_THRESHOLD:
+        # Локальная редкость в приоритете: большое число наблюдений в мире
+        # не делает вид обычным в этом районе.
         rare_emoji, rare_label = "🔴", "редкая в этом районе"
     elif local_count <= RARITY_LOCAL_UNCOMMON_THRESHOLD:
         rare_emoji, rare_label = "🟡", "нечасто встречается"
@@ -1037,13 +1243,92 @@ async def _disable_user_alerts(telegram_id: int):
     except Exception:
         logger.error(f"Не удалось отключить уведомления для {telegram_id}", exc_info=True)
 
+# Ошибки, после которых исход запроса к Telegram НЕИЗВЕСТЕН (карточка могла дойти):
+# повторная отправка другим способом дала бы дубль, поэтому в этих случаях fallback не выполняется.
+_UNCERTAIN_SEND_ERRORS = (TelegramNetworkError, TelegramServerError, aiohttp.ClientError, asyncio.TimeoutError)
+
+# ---------- Rich Messages (Bot API 10.1+) ----------
+_CARD_TITLE_RE = re.compile(r"^(?P<emoji>[^\s<]+)\s+<b>(?P<name>.*?)</b>(?:\s+<i>(?P<sci>.*?)</i>)?\s*$")
+
+def _rich_strip_tags(s: str) -> str:
+    return re.sub(r"</?(?:b|i|u|s)>", "", s)
+
+def _card_to_rich_html(photo_url: str | None, text: str) -> str | None:
+    """Строит Rich HTML из готового HTML-текста карточки (общий формат всех карточек BAM):
+    фото, заголовок, латинское название, список фактов и подпись. Данные не выдумываются:
+    используются только строки исходного текста. Возвращает None, если структура текста
+    незнакома, - тогда отправляется обычная карточка."""
+    groups: list[list[str]] = []
+    cur: list[str] = []
+    for raw in (text or "").split("\n"):
+        line = raw.strip()
+        if line:
+            cur.append(line)
+        elif cur:
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    if not groups:
+        return None
+
+    m = _CARD_TITLE_RE.match(groups[0][0])
+    if not m:
+        return None
+
+    parts: list[str] = []
+    if photo_url and photo_url.lower().startswith(("https://", "http://")):
+        parts.append(f'<img src="{html_module.escape(photo_url, quote=True)}"/>')
+    parts.append(f"<h2>{m.group('emoji')} {_rich_strip_tags(m.group('name'))}</h2>")
+    if m.group("sci"):
+        parts.append(f"<p><i>{m.group('sci')}</i></p>")
+
+    body: list[str] = list(groups[0][1:])
+    for g in groups[1:]:
+        body.extend(g)
+
+    footer = ""
+    if len(groups) > 1 and len(groups[-1]) == 1:
+        last = groups[-1][0]
+        if last.startswith("<i>") or last[:1].isalpha():
+            footer = _rich_strip_tags(last)
+            body = body[:-1]
+
+    if body:
+        parts.append("<ul>" + "".join(f"<li>{ln}</li>" for ln in body) + "</ul>")
+    if footer:
+        parts.append(f"<footer>{footer}</footer>")
+    return "".join(parts)
+
+def _rich_is_active() -> bool:
+    return RICH_MESSAGES_ENABLED and time() >= _rich_disabled_until
+
+def _rich_note_success():
+    global _rich_fail_streak
+    _rich_fail_streak = 0
+
+def _rich_note_failure(reason: str):
+    """Если Telegram подряд отклоняет Rich Message, временно отключаем их, чтобы не слать лишние запросы."""
+    global _rich_fail_streak, _rich_disabled_until
+    _rich_fail_streak += 1
+    if _rich_fail_streak >= RICH_FAIL_LIMIT:
+        _rich_fail_streak = 0
+        _rich_disabled_until = time() + RICH_DISABLE_SEC
+        logger.error(
+            f"Rich Messages: {RICH_FAIL_LIMIT} отказов подряд, отключаю на {RICH_DISABLE_SEC // 60} мин "
+            f"(последняя причина: {reason})"
+        )
+
 async def safe_send_card(
     telegram_id: int,
     photo_url: str | None,
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> str:
-    """Единый надёжный механизм отправки карточки (fallback send_photo -> send_message).
+    """Единый надёжный механизм отправки карточки: Rich Message -> send_photo -> send_message.
+    Следующий способ пробуется только после ОДНОЗНАЧНОГО отказа Telegram (ошибка формата, недоступное фото).
+    После сетевой ошибки или таймаута исход неизвестен: повторная отправка дала бы дубль,
+    поэтому возвращается 'transient_error' (очередь уведомлений повторит отправку позже).
     Возвращает статус: 'sent' | 'blocked' | 'transient_error' | 'failed'.
     """
     sem = _tg_send_semaphore or asyncio.Semaphore(TG_SEND_SEMAPHORE_LIMIT)
@@ -1067,6 +1352,39 @@ async def safe_send_card(
                 await asyncio.sleep(wait_sec)
         return "transient_error"
 
+    # 1) Rich Message (любая однозначная ошибка -> обычная карточка ниже)
+    if _rich_is_active():
+        try:
+            rich_html = _card_to_rich_html(photo_url, text)
+        except Exception as ex:
+            logger.warning(f"Rich Message: не удалось разобрать карточку ({type(ex).__name__}: {ex})")
+            rich_html = None
+        if rich_html:
+            try:
+                res = await _call_tg(
+                    lambda: bot.send_rich_message(
+                        chat_id=telegram_id,
+                        rich_message=InputRichMessage(html=rich_html),
+                        reply_markup=reply_markup,
+                    )
+                )
+                if res == "sent":
+                    _rich_note_success()
+                if res in ("sent", "blocked"):
+                    return res
+            except _UNCERTAIN_SEND_ERRORS as ex:
+                logger.error(
+                    f"Rich Message для user {telegram_id}: исход неизвестен ({type(ex).__name__}: {ex}), "
+                    f"повторная отправка отложена"
+                )
+                return "transient_error"
+            except Exception as ex:
+                logger.warning(
+                    f"Rich Message не принят для user {telegram_id} ({type(ex).__name__}: {ex}) - обычная карточка"
+                )
+                _rich_note_failure(f"{type(ex).__name__}: {ex}")
+
+    # 2) Классическая карточка: фото с подписью
     if photo_url:
         try:
             res = await _call_tg(
@@ -1077,18 +1395,25 @@ async def safe_send_card(
             )
             if res in ("sent", "blocked"):
                 return res
+        except _UNCERTAIN_SEND_ERRORS as ex:
+            logger.error(
+                f"send_photo для user {telegram_id}: исход неизвестен ({type(ex).__name__}: {ex}), "
+                f"повторная отправка отложена"
+            )
+            return "transient_error"
         except Exception as ex:
             logger.warning(
-                f"Ошибка send_photo для user {telegram_id} ({type(ex).__name__}: {ex}) — fallback на send_message"
+                f"Ошибка send_photo для user {telegram_id} ({type(ex).__name__}: {ex}) - fallback на send_message"
             )
 
+    # 3) Текст без фото
     try:
         return await _call_tg(
             lambda: bot.send_message(
                 telegram_id, text, reply_markup=reply_markup, parse_mode="HTML",
             )
         )
-    except (TelegramNetworkError, TelegramServerError, aiohttp.ClientError, asyncio.TimeoutError) as ex:
+    except _UNCERTAIN_SEND_ERRORS as ex:
         logger.error(f"Временная ошибка Telegram для user {telegram_id}: {type(ex).__name__}: {ex}")
         return "transient_error"
     except TelegramBadRequest as ex:
@@ -1393,12 +1718,13 @@ async def process_pending_notifications():
 
 # ================= КЛАВИАТУРА =================
 async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    if user_id not in _fav_count_cache:
+    fav_count = _fav_count_cache.get(user_id)
+    if fav_count is None:
         rows = await db_fetch_all(
             "SELECT COUNT(*) FROM favorites WHERE telegram_id = ?", (user_id,)
         )
-        _fav_count_cache[user_id] = rows[0][0] if rows else 0
-    fav_count = _fav_count_cache[user_id]
+        fav_count = rows[0][0] if rows else 0
+        _fav_count_cache.set(user_id, fav_count)
     fav_label = f"⭐ Вишлист ({fav_count})" if fav_count else "⭐ Вишлист"
     kb = [
         [KeyboardButton(text="🐦 Сканировать"), KeyboardButton(text="📷 Определить птицу")],
@@ -1406,6 +1732,11 @@ async def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="⚙️ Настройки")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+async def _user_has_location(user_id: int) -> bool:
+    """Быстрая локальная проверка (без сети): указал ли пользователь местоположение."""
+    row = await db_fetch_one("SELECT lat FROM users WHERE telegram_id = ?", (user_id,))
+    return bool(row and row[0] is not None)
 
 def _location_request_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -1417,6 +1748,21 @@ def _location_request_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+# ================= УСТАРЕВШИЕ КНОПКИ =================
+class _StaleCallbackMiddleware(BaseMiddleware):
+    """CallbackQuery.message (Bot API 7.0+) может быть InaccessibleMessage: сообщение удалено или ему больше
+    48 часов. Обработчикам нужен обычный Message, поэтому такие нажатия отсекаем с понятным ответом."""
+    async def __call__(self, handler, event: CallbackQuery, data: dict):
+        if not isinstance(getattr(event, "message", None), Message):
+            try:
+                await event.answer("⚠️ Кнопка устарела. Откройте нужный раздел из меню заново.", show_alert=True)
+            except Exception:
+                pass
+            return None
+        return await handler(event, data)
+
+router.callback_query.outer_middleware(_StaleCallbackMiddleware())
+
 # ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
 @router.errors()
 async def global_error_handler(event: ErrorEvent):
@@ -1426,7 +1772,14 @@ async def global_error_handler(event: ErrorEvent):
         if update.message:
             await update.message.answer("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
         elif update.callback_query:
-            await update.callback_query.answer("⚠️ Ошибка. Попробуйте позже.", show_alert=True)
+            cb = update.callback_query
+            try:
+                await cb.answer("⚠️ Ошибка. Попробуйте позже.", show_alert=True)
+            except Exception:
+                # Длительные обработчики подтверждают нажатие заранее: повторный ответ невозможен,
+                # поэтому сообщаем об ошибке сообщением в чат.
+                if isinstance(cb.message, Message):
+                    await cb.message.answer("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
     except Exception:
         pass
 
@@ -1517,7 +1870,30 @@ async def cancel_location_request(message: Message, state: FSMContext):
         reply_markup=await main_keyboard(message.from_user.id),
     )
 
-@router.message(Form.waiting_city)
+_MENU_BUTTON_PREFIXES = ("🐦 Сканировать", "📷 Определить птицу", "🚨 Редкие птицы", "⭐ Вишлист", "⚙️ Настройки")
+
+def _is_menu_button(message: Message) -> bool:
+    return bool(message.text) and message.text.startswith(_MENU_BUTTON_PREFIXES)
+
+# Регистрируется РАНЬШЕ обработчиков ввода: нажатие кнопки главного меню во время ввода города или радиуса
+# не должно трактоваться как название города / число, а должно выйти из режима ввода и выполнить команду.
+@router.message(StateFilter(Form.waiting_city, Form.waiting_custom_radius), _is_menu_button)
+async def menu_button_in_input_state(message: Message, state: FSMContext):
+    await state.clear()
+    text = message.text or ""
+    if text.startswith("🐦 Сканировать"):
+        await scan(message)
+    elif text.startswith("📷 Определить птицу"):
+        await ask_for_photo(message)
+    elif text.startswith("🚨 Редкие птицы"):
+        await manual_rare(message)
+    elif text.startswith("⭐ Вишлист"):
+        await show_wishlist(message)
+    elif text.startswith("⚙️ Настройки"):
+        await settings(message)
+
+# F.text: нетекстовые сообщения (например, фото) в режиме ввода не «съедаются» этим обработчиком.
+@router.message(Form.waiting_city, F.text)
 async def handle_city_input(message: Message, state: FSMContext):
     if not message.from_user or not message.text:
         return
@@ -1569,19 +1945,33 @@ async def ask_for_photo(message: Message):
 async def handle_photo(message: Message):
     if not message.from_user:
         return
-    uid     = message.from_user.id
+    uid   = message.from_user.id
+    photo = message.photo[-1]
+    if photo.file_size and photo.file_size > MAX_PHOTO_BYTES:
+        await message.answer("❌ Фото слишком большое. Пришлите изображение размером до 10 МБ.")
+        return
+
+    # Умеренное ограничение: один пользователь не должен занимать все слоты CV API серией фото.
+    now  = time()
+    last = _photo_cooldown.get(uid, 0)
+    if now - last < PHOTO_COOLDOWN_SEC:
+        if not message.media_group_id:  # альбом приходит пачкой сообщений - на каждое не отвечаем
+            wait_left = max(1, int(PHOTO_COOLDOWN_SEC - (now - last)) + 1)
+            await message.answer(f"⏳ Подождите {wait_left} сек. перед следующим фото.")
+        return
+    _photo_cooldown[uid] = now
+
     wait_ms = await message.answer("🔍 Анализирую фото...")
 
     row = await db_fetch_one("SELECT lat, lon FROM users WHERE telegram_id = ?", (uid,))
     lat, lon = (row[0], row[1]) if row and row[0] is not None else (None, None)
 
-    photo = message.photo[-1]
     try:
         buf = io.BytesIO()
         await bot.download(photo, destination=buf)
         photo_bytes = buf.getvalue()
-        if not photo_bytes:
-            raise ValueError("Пустой буфер изображения")
+        if not photo_bytes or len(photo_bytes) > MAX_PHOTO_BYTES:
+            raise ValueError("Пустой или слишком большой буфер изображения")
     except Exception as ex:
         try:
             await wait_ms.delete()
@@ -1607,7 +1997,7 @@ async def handle_photo(message: Message):
     text = "🐦 <b>Возможные виды:</b>\n\n"
     kb_rows = []
     for i, item in enumerate(results[:5], 1):
-        t     = item.get("taxon", {})
+        t     = item.get("taxon") or {}
         name  = t.get("preferred_common_name") or t.get("name", "Неизвестно")
         sci   = t.get("name", "")
         score = item.get("combined_score", 0)
@@ -1626,13 +2016,6 @@ async def handle_photo(message: Message):
         text += "📍 <i>Результат уточнён по вашему местоположению</i>"
     else:
         text += "💡 <i>Укажите город или геолокацию для более точного определения</i>"
-
-    first_tid = results[0].get("taxon", {}).get("id")
-    if first_tid:
-        kb_rows.append([InlineKeyboardButton(
-            text="🐦 Открыть карточку первого вида",
-            callback_data=f"bird:{first_tid}:0",
-        )])
 
     await message.answer(
         text,
@@ -1656,7 +2039,7 @@ async def scan(message: Message):
     await wait_msg.delete()
 
     if text is None:
-        return await message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
+        return await message.answer("❌ Сначала укажите местоположение: ⚙️ Настройки → «🏠 Ввести город» или «📍 Геолокация».")
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("scan_page:"))
@@ -1666,18 +2049,24 @@ async def scan_page_cb(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer("⚠️ Устаревшая кнопка.", show_alert=True)
         return
-    text, kb = await _build_scan_content(callback.from_user.id, page=page)
-    if text is None:
+    if not await _user_has_location(callback.from_user.id):
         await callback.answer("❌ Сначала укажите город!", show_alert=True)
         return
-    if callback.message.photo or callback.message.document:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    # Страница может строиться через сеть (iNaturalist): подтверждаем нажатие сразу, до долгих запросов.
+    await callback.answer()
+    text, kb = await _build_scan_content(callback.from_user.id, page=page)
+    if text is None:
+        await callback.message.answer("❌ Сначала укажите город!")
+        return
+    msg = callback.message
+    # Карточка птицы (фото или Rich Message) не редактируется в список: список приходит новым сообщением.
+    if msg.photo or msg.document or getattr(msg, "rich_message", None):
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
     else:
         try:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception:
-            await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
 async def _build_scan_content(user_id: int, page: int):
     row = await db_fetch_one(
@@ -1763,6 +2152,9 @@ async def show_bird(callback: CallbackQuery):
         await callback.answer("❌ Сначала укажите город!", show_alert=True)
         return
 
+    # Минимальная проверка пройдена: подтверждаем нажатие сразу, дальше идут сетевые запросы.
+    await callback.answer()
+
     lat, lon, radius, days = row
 
     obs, rare_result = await asyncio.gather(
@@ -1773,16 +2165,18 @@ async def show_bird(callback: CallbackQuery):
 
     if not obs:
         await callback.message.answer("❌ Нет свежих наблюдений этого вида в радиусе.")
-        await callback.answer()
         return
 
-    name         = e(obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"])
-    sci          = e(obs["taxon"].get("name", ""))
+    raw_name     = obs["taxon"].get("preferred_common_name") or obs["taxon"]["name"]
+    raw_sci      = obs["taxon"].get("name", "")
+    name         = e(raw_name)
+    sci          = e(raw_sci)
     obs_lat, obs_lon = _parse_obs_coords(obs)
     ago          = time_ago(obs.get("time_observed_at") or obs.get("observed_on"))
     obs_url      = f"https://www.inaturalist.org/observations/{obs['id']}"
-    dist_str     = (f"📍 {haversine(lat, lon, obs_lat, obs_lon)} км от вас\n"
-                    if obs_lat is not None else "📍 Координаты скрыты автором\n")
+    dist_km      = haversine(lat, lon, obs_lat, obs_lon) if obs_lat is not None else None
+    dist_str     = (f"📍 {dist_km} км от вас\n"
+                    if dist_km is not None else "📍 Координаты скрыты автором\n")
 
     photo_medium   = get_photo_url(obs, "medium")
     photo_original = get_photo_url(obs, "original")
@@ -1816,12 +2210,27 @@ async def show_bird(callback: CallbackQuery):
     if photo_original:
         kb_rows.append([InlineKeyboardButton(text="🔍 Фото в полном размере", url=photo_original)])
     kb_rows.append([InlineKeyboardButton(text=fav_text, callback_data=fav_data)])
+    if WIDGETS_ENABLED:
+        # Сведения для виджета берутся из этой карточки (без повторных запросов к iNaturalist).
+        taxon_res  = (taxon_data or {}).get("results") or []
+        cs_dict    = (taxon_res[0].get("conservation_status") or {}) if taxon_res else {}
+        _bird_facts_cache.set((callback.from_user.id, taxon_id), {
+            "name":   raw_name,
+            "sci":    raw_sci,
+            "order":  order_name,
+            "family": family_name,
+            "rare":   f"{rare_emoji} {rare_label.capitalize()}",
+            "iucn":   _conservation_label(cs_dict) if cs_dict else "",
+            "season": season_text.replace("📅 ", "") if season_text else "",
+            "flags":  list(flags),
+            "near":   (f"{dist_km} км · {ago}" if dist_km is not None else ago),
+        })
+        kb_rows.append([InlineKeyboardButton(text="🧩 Виджет", callback_data=f"widget:{taxon_id}")])
     if back_page is not None and back_page > 0:
         kb_rows.append([InlineKeyboardButton(text="← К списку", callback_data=f"scan_page:{back_page}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await safe_send_card(callback.from_user.id, photo_medium, text, kb)
-    await callback.answer()
 
 # ================= ВИШЛИСТ =================
 @router.message(F.text.startswith("⭐ Вишлист"))
@@ -1846,16 +2255,45 @@ async def show_wishlist(message: Message):
     text    = "⭐ <b>Вишлист</b>\n\nНажмите на птицу, чтобы удалить её:\n\n"
     kb_rows = []
     for tid, name in favs:
-        text += f"• {e(name)}\n"
+        line = f"• {e(name)}\n"
+        # Лимиты Telegram: не более 100 кнопок и 4096 символов в сообщении.
+        if len(kb_rows) >= 100 or len(text) + len(line) > 3800:
+            break
+        text += line
         kb_rows.append([InlineKeyboardButton(text=f"❌ {name}", callback_data=f"fav_remove:{tid}")])
+    if len(kb_rows) < len(favs):
+        text += f"\n…и ещё {len(favs) - len(kb_rows)}. Удалите часть птиц, чтобы увидеть остальных."
 
     await message.answer(text, parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
+async def add_to_wishlist(uid: int, taxon_id: int) -> tuple[str, str]:
+    """Единая логика добавления птицы в вишлист (кнопка карточки и виджет).
+    Возвращает (статус, название): 'added' | 'exists' | 'limit'."""
+    existing = await db_fetch_one(
+        "SELECT taxon_name FROM favorites WHERE telegram_id = ? AND taxon_id = ?", (uid, taxon_id),
+    )
+    if existing:
+        return "exists", existing[0] or str(taxon_id)
+    cnt = await db_fetch_one("SELECT COUNT(*) FROM favorites WHERE telegram_id = ?", (uid,))
+    if cnt and cnt[0] >= MAX_FAVORITES:
+        return "limit", ""
+    name = await get_taxon_name(taxon_id)
+    await db_exec(
+        "INSERT OR IGNORE INTO favorites (telegram_id, taxon_id, taxon_name) VALUES (?, ?, ?)",
+        (uid, taxon_id, name),
+    )
+    _invalidate_fav_count(uid)
+    return "added", name
+
 @router.callback_query(F.data.startswith("fav_add:"))
 async def fav_add(callback: CallbackQuery):
-    uid      = callback.from_user.id
-    taxon_id = int(callback.data.split(":")[1])
+    uid = callback.from_user.id
+    try:
+        taxon_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("⚠️ Устаревшая кнопка.", show_alert=True)
+        return
 
     ck  = (uid, taxon_id)
     now = time()
@@ -1864,12 +2302,14 @@ async def fav_add(callback: CallbackQuery):
         return
     _fav_cooldown[ck] = now
 
-    name = await get_taxon_name(taxon_id)
-    await db_exec(
-        "INSERT OR IGNORE INTO favorites (telegram_id, taxon_id, taxon_name) VALUES (?, ?, ?)",
-        (uid, taxon_id, name),
-    )
-    _invalidate_fav_count(uid)
+    # Название вида при пустом кэше берётся из сети: подтверждаем нажатие сразу.
+    await callback.answer()
+    status, name = await add_to_wishlist(uid, taxon_id)
+    if status == "limit":
+        await bot.send_message(
+            uid, f"⚠️ В вишлисте может быть не более {MAX_FAVORITES} птиц. Удалите лишние и попробуйте снова.",
+        )
+        return
 
     new_kb = _replace_fav_button(callback.message.reply_markup, taxon_id, added=True)
     try:
@@ -1887,7 +2327,6 @@ async def fav_add(callback: CallbackQuery):
         reply_markup=await main_keyboard(uid),
         parse_mode="HTML",
     )
-    await callback.answer("⭐ Добавлено!", show_alert=False)
 
 @router.callback_query(F.data.startswith("fav_remove:"))
 async def fav_remove(callback: CallbackQuery):
@@ -1932,6 +2371,251 @@ def _replace_fav_button(markup: InlineKeyboardMarkup | None,
                 new_row.append(btn)
         new_rows.append(new_row)
     return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
+# ================= 🧩 HTML-ВИДЖЕТ ПТИЦЫ (Bot API 10.4) =================
+# Виджет - небольшой блок прямо в сообщении; в production работает в личном чате с ботом.
+# HTML фиксируется при отправке, меняется только состояние chat_data, которое пишет бот.
+# Кнопка виджета отправляет боту короткий запрос (widget_query), как callback-кнопка.
+# Все сведения о птице дублируются в обычной подписи сообщения: виджет не единственный способ их получить.
+_WIDGET_STYLE = (
+    "body{margin:0;padding:10px 12px}"
+    ".n{font-size:1.2em;font-weight:600;line-height:1.25}"
+    ".l{color:var(--tg-theme-hint-color);font-style:italic;margin:2px 0 8px}"
+    ".g{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0 0 10px}"
+    ".k{color:var(--tg-theme-hint-color)}"
+    "button{width:100%}"
+    "#m{min-height:1.3em;margin-top:6px;font-size:.9em;color:var(--tg-theme-hint-color)}"
+    "#m.ok{color:var(--tg-theme-accent-text-color)}"
+    "#m.er{color:var(--tg-theme-destructive-text-color)}"
+)
+
+# Протокол: запрос виджета "wl:<taxon_id>"; ответ бота начинается с "1" (птица в вишлисте) или "0" (нет),
+# дальше - короткий текст для показа. Состояние сообщения (chat_data): {"w":1} - птица в вишлисте.
+_WIDGET_SCRIPT = """(function(){
+var W=window.TelegramWidget,b=document.getElementById('b'),m=document.getElementById('m'),T='__TID__',done=0,busy=0;
+function has(){if(done)return 1;try{return JSON.parse(W.chatData).w===1}catch(x){return 0}}
+function draw(){var f=has();b.textContent=f?'✅ В вишлисте':'⭐ Добавить в вишлист';b.disabled=!!(f||busy)}
+function say(t,c){m.className=c||'';m.textContent=t||''}
+b.onclick=function(){
+if(!W||busy||has())return;
+busy=1;draw();say('Отправляю…');
+W.request('wl:'+T).then(function(a){
+var r=(a&&a.result)||'0Нет ответа',ok=r.charAt(0)==='1';
+busy=0;if(ok)done=1;say(r.slice(1),ok?'ok':'er');draw()
+},function(x){
+busy=0;say(x&&x.code==='RATE_LIMITED'?'Слишком часто, подождите':'Не удалось ('+(x&&x.code)+')','er');draw()
+})};
+if(W){W.onEvent('chatDataChanged',draw);W.ready()}
+draw()
+})();"""
+
+_WIDGET_REQ_RE = re.compile(r"^wl:(\d{1,10})$")
+
+def _widget_fits(doc: str) -> bool:
+    """Лимиты Telegram: HTML до 32768 байт и до 4096 байт после zlib (уровень 9)."""
+    raw = doc.encode("utf-8")
+    return len(raw) <= 32768 and len(zlib.compress(raw, 9)) <= 4096
+
+def _widget_rows(facts: dict) -> list[tuple[str, str]]:
+    rows = [
+        ("Отряд",       facts.get("order") or ""),
+        ("Семейство",   facts.get("family") or ""),
+        ("Редкость",    facts.get("rare") or ""),
+        ("IUCN",        facts.get("iucn") or ""),
+        ("Сезон",       facts.get("season") or ""),
+        ("Рядом",       facts.get("near") or ""),
+        ("Особенности", " · ".join(facts.get("flags") or [])),
+    ]
+    return [(k, v) for k, v in rows if v]
+
+def _build_widget_html(facts: dict, taxon_id: int) -> str | None:
+    """HTML виджета: название, характеристики и кнопка вишлиста. Все данные экранируются.
+    Если документ не укладывается в лимиты, лишние строки отбрасываются. None - если не уместился совсем."""
+    script = _WIDGET_SCRIPT.replace("__TID__", str(int(taxon_id)))
+    title  = e(facts.get("name") or "")
+    sci    = e(facts.get("sci") or "")
+    rows   = _widget_rows(facts)
+    while True:
+        grid = "".join(
+            '<span class="k">' + e(k) + "</span><span>" + e(v) + "</span>" for k, v in rows
+        )
+        doc = (
+            "<style>" + _WIDGET_STYLE + "</style>"
+            '<div class="n">🐦 ' + title + "</div>"
+            '<div class="l">' + sci + "</div>"
+            '<div class="g">' + grid + "</div>"
+            '<button id="b"></button><div id="m"></div>'
+            "<script>" + script + "</script>"
+        )
+        if _widget_fits(doc):
+            return doc
+        if not rows:
+            return None
+        rows = rows[:-1]
+
+def _build_widget_caption(facts: dict) -> str:
+    """Обычная подпись сообщения с виджетом: те же сведения текстом (для клиентов без поддержки виджетов)."""
+    lines = ["🐦 <b>" + e(facts.get("name") or "") + "</b>  <i>" + e(facts.get("sci") or "") + "</i>"]
+    tax = " · ".join(filter(None, [e(facts.get("order") or ""), e(facts.get("family") or "")]))
+    if tax:
+        lines.append("🔬 " + tax)
+    if facts.get("rare"):
+        lines.append(e(facts["rare"]))
+    if facts.get("iucn"):
+        lines.append("🛡 IUCN: " + e(facts["iucn"]))
+    if facts.get("season"):
+        lines.append("📅 " + e(facts["season"]))
+    if facts.get("near"):
+        lines.append("📍 " + e(facts["near"]))
+    for fl in facts.get("flags") or []:
+        lines.append(e(fl))
+    lines.append("")
+    lines.append("<i>Добавить птицу в вишлист можно кнопкой в виджете или кнопкой «⭐ В вишлист» в карточке.</i>")
+    return "\n".join(lines)
+
+async def _facts_from_taxon(taxon_id: int) -> dict | None:
+    """Сведения для виджета только по таксону (если карточка птицы давно не открывалась)."""
+    data = await get_taxon_data(taxon_id)
+    res  = (data or {}).get("results") or []
+    if not res:
+        return None
+    tx = res[0]
+    family_name, order_name = _extract_taxonomy(data)
+    cs = tx.get("conservation_status") or {}
+    return {
+        "name":   tx.get("preferred_common_name") or tx.get("name") or str(taxon_id),
+        "sci":    tx.get("name") or "",
+        "order":  order_name,
+        "family": family_name,
+        "rare":   "",
+        "iucn":   _conservation_label(cs) if cs else "",
+        "season": "",
+        "flags":  _extract_taxon_flags(data),
+        "near":   "",
+    }
+
+@router.callback_query(F.data.startswith("widget:"))
+async def send_bird_widget(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not WIDGETS_ENABLED:
+        await callback.answer("Виджеты сейчас недоступны.", show_alert=True)
+        return
+    try:
+        taxon_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("⚠️ Устаревшая кнопка.", show_alert=True)
+        return
+
+    ck  = (uid, "widget", taxon_id)
+    now = time()
+    if now - _fav_cooldown.get(ck, 0) < 5:
+        await callback.answer("⏳ Подождите немного...", show_alert=False)
+        return
+    _fav_cooldown[ck] = now
+    await callback.answer()
+
+    facts = _bird_facts_cache.get((uid, taxon_id)) or await _facts_from_taxon(taxon_id)
+    if not facts:
+        await callback.message.answer("❌ Не удалось получить данные о виде. Откройте карточку птицы заново.")
+        return
+    in_fav = await db_fetch_one(
+        "SELECT 1 FROM favorites WHERE telegram_id = ? AND taxon_id = ?", (uid, taxon_id),
+    ) is not None
+    widget_html = _build_widget_html(facts, taxon_id)
+    if not widget_html:
+        await callback.message.answer("❌ Не удалось собрать виджет. Все сведения о птице есть в карточке.")
+        return
+
+    try:
+        sem = _tg_send_semaphore or asyncio.Semaphore(TG_SEND_SEMAPHORE_LIMIT)
+        async with sem:
+            await bot.send_widget(
+                chat_id=uid,
+                html=widget_html,
+                caption=_build_widget_caption(facts),
+                parse_mode="HTML",
+                allow_queries=True,
+                chat_data=json.dumps({"w": 1 if in_fav else 0}, separators=(",", ":")),
+            )
+    except Exception as ex:
+        if _is_user_blocked_error(ex):
+            await _disable_user_alerts(uid)
+            return
+        logger.warning(f"sendWidget для user {uid}: {type(ex).__name__}: {ex}")
+        await callback.message.answer("❌ Telegram не принял виджет. Все сведения о птице есть в карточке выше.")
+
+async def _widget_wishlist_add(uid: int, taxon_id: int) -> tuple[str, bool]:
+    """Действие «Добавить в вишлист» из виджета: общая логика add_to_wishlist().
+    Идентификатор вида приходит из виджета и считается недоверенным: проверяем, что это существующая птица.
+    Возвращает (ответ виджету, находится ли птица в вишлисте)."""
+    data = await get_taxon_data(taxon_id)
+    res  = (data or {}).get("results") or []
+    if not res:
+        return "0Вид не найден", False
+    tx = res[0]
+    if not (tx.get("iconic_taxon_name") == "Aves" or 3 in (tx.get("ancestor_ids") or [])):
+        return "0Это не птица", False
+    status, _name = await add_to_wishlist(uid, taxon_id)
+    if status == "limit":
+        return f"0Вишлист заполнен ({MAX_FAVORITES})", False
+    if status == "exists":
+        return "1Уже в вишлисте", True
+    return "1Добавлено в вишлист", True
+
+async def _widget_set_state(chat_id: int, message_id: int, in_wishlist: bool):
+    """Состояние виджета пишет только бот: chat_data = {"w":1}. «message is not modified» считаем успехом."""
+    try:
+        await bot.edit_message_widget_data(
+            chat_id=chat_id,
+            message_id=message_id,
+            chat_data=json.dumps({"w": 1 if in_wishlist else 0}, separators=(",", ":")),
+        )
+    except TelegramBadRequest as ex:
+        if "not modified" not in str(ex).lower():
+            logger.warning(f"editMessageWidgetData: {ex}")
+    except Exception as ex:
+        logger.warning(f"editMessageWidgetData: {type(ex).__name__}: {ex}")
+
+if WIDGETS_ENABLED:
+    @router.widget_query()
+    async def on_widget_query(query: WidgetQuery):
+        reply       = "0Не удалось выполнить действие"
+        set_state   = False
+        chat_id     = None
+        message_id  = None
+        try:
+            user = query.from_user  # пользователя определяет Telegram, идентификаторам из виджета не доверяем
+            chat = query.chat
+            if (user is None or user.is_bot or chat is None or chat.type != "private"
+                    or chat.id != user.id or query.message_id is None):
+                reply = "0Действие недоступно в этом чате"
+            else:
+                chat_id, message_id = chat.id, query.message_id
+                m   = _WIDGET_REQ_RE.match(query.data or "")
+                now = time()
+                if not m:
+                    reply = "0Неизвестное действие"
+                elif now - _fav_cooldown.get((user.id, "wq"), 0) < 1.0:
+                    reply = "0Слишком часто, подождите секунду"
+                else:
+                    _fav_cooldown[(user.id, "wq")] = now
+                    reply, set_state = await asyncio.wait_for(
+                        _widget_wishlist_add(user.id, int(m.group(1))), timeout=10,
+                    )
+        except asyncio.TimeoutError:
+            reply = "0iNaturalist отвечает долго, попробуйте позже"
+        except Exception as ex:
+            logger.error(f"widget_query: {type(ex).__name__}: {ex}", exc_info=True)
+            reply = "0Ошибка, попробуйте позже"
+
+        # На каждый запрос нужно ответить в течение 15 секунд (иначе в виджете TIMEOUT).
+        try:
+            await bot.answer_widget_query(widget_query_id=query.id, data=reply)
+        except Exception as ex:
+            logger.warning(f"answerWidgetQuery: {type(ex).__name__}: {ex}")
+        # Ответ не меняет состояние: chat_data обновляем отдельным методом, уже после ответа.
+        if set_state and chat_id is not None and message_id is not None:
+            await _widget_set_state(chat_id, message_id, True)
 
 # ================= НАСТРОЙКИ =================
 def _build_settings_content(r: int, d: int, alerts: int, season: int,
@@ -2015,7 +2699,7 @@ async def goto_scan(callback: CallbackQuery):
     text, kb = await _build_scan_content(uid, page=1)
     await wait_msg.delete()
     if text is None:
-        await callback.message.answer("❌ Сначала укажите город кнопкой «🏠 Город»!")
+        await callback.message.answer("❌ Сначала укажите местоположение: ⚙️ Настройки → «🏠 Ввести город» или «📍 Геолокация».")
         return
     await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
@@ -2034,14 +2718,15 @@ async def toggle_alerts(callback: CallbackQuery):
            ON CONFLICT(telegram_id) DO UPDATE SET alerts_enabled = excluded.alerts_enabled""",
         (uid, new_val),
     )
+    # Изменение уже записано в БД: подтверждаем нажатие до сетевого reverse-геокодирования.
+    label = "включены ✅" if new_val else "выключены ❌"
+    await callback.answer(f"🔔 Уведомления {label}", show_alert=False)
     location_name = await reverse_geocode(lat, lon) if lat is not None and lon is not None else ""
     text, kb = _build_settings_content(r, d, new_val, season, location_name)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
-    label = "включены ✅" if new_val else "выключены ❌"
-    await callback.answer(f"🔔 Уведомления {label}", show_alert=False)
 
 @router.callback_query(F.data == "toggle_season")
 async def toggle_season(callback: CallbackQuery):
@@ -2059,14 +2744,14 @@ async def toggle_season(callback: CallbackQuery):
         (uid, new_season),
     )
     _invalidate_scan_cache(uid)
+    label = f"включён ({current_season_name()})" if new_season else "выключен"
+    await callback.answer(f"🌿 Сезонный фильтр {label}", show_alert=False)
     location_name = await reverse_geocode(lat, lon) if lat is not None and lon is not None else ""
     text, kb = _build_settings_content(r, d, alerts, new_season, location_name)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
-    label = f"включён ({current_season_name()})" if new_season else "выключен"
-    await callback.answer(f"🌿 Сезонный фильтр {label}", show_alert=False)
 
 @router.callback_query(F.data.startswith("set_r:"))
 async def set_radius(callback: CallbackQuery, state: FSMContext):
@@ -2096,6 +2781,7 @@ async def set_radius(callback: CallbackQuery, state: FSMContext):
         (uid, r),
     )
     _invalidate_scan_cache(uid)
+    await callback.answer(f"✅ Радиус: {r} км", show_alert=False)
     row = await db_fetch_one(
         "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
         (uid,),
@@ -2107,9 +2793,8 @@ async def set_radius(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
-    await callback.answer(f"✅ Радиус: {r} км", show_alert=False)
 
-@router.message(Form.waiting_custom_radius)
+@router.message(Form.waiting_custom_radius, F.text)
 async def handle_custom_radius(message: Message, state: FSMContext):
     if not message.from_user or not message.text:
         return
@@ -2135,7 +2820,14 @@ async def handle_custom_radius(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("set_d:"))
 async def set_days(callback: CallbackQuery):
     uid = callback.from_user.id
-    d   = int(callback.data.split(":")[1])
+    try:
+        d = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("⚠️ Недопустимое значение.", show_alert=True)
+        return
+    if d not in {1, 3, 7, 30}:
+        await callback.answer("⚠️ Недопустимое значение.", show_alert=True)
+        return
     await db_exec(
         """INSERT INTO users (telegram_id, lat, lon, radius, period_days, alerts_enabled, season_filter)
            VALUES (?, NULL, NULL, 10, ?, 1, 0)
@@ -2143,6 +2835,7 @@ async def set_days(callback: CallbackQuery):
         (uid, d),
     )
     _invalidate_scan_cache(uid)
+    await callback.answer(f"✅ Период: {d} дней", show_alert=False)
     row = await db_fetch_one(
         "SELECT radius, period_days, alerts_enabled, season_filter, lat, lon FROM users WHERE telegram_id = ?",
         (uid,),
@@ -2154,7 +2847,6 @@ async def set_days(callback: CallbackQuery):
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
-    await callback.answer(f"✅ Период: {d} дней", show_alert=False)
 
 # ================= 🚨 РЕДКИЕ ПТИЦЫ =================
 def _obs_within_hours(obs: dict, cutoff: datetime) -> bool:
@@ -2171,7 +2863,15 @@ def _obs_within_hours(obs: dict, cutoff: datetime) -> bool:
 
 @router.message(F.text == "🚨 Редкие птицы")
 async def manual_rare(message: Message):
-    await check_rare_for_user(message.from_user.id, manual=True)
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    now = time()
+    if now - _rare_cooldown.get(uid, 0) < RARE_MANUAL_COOLDOWN_SEC:
+        await message.answer("⏳ Подождите немного перед следующей проверкой редких птиц.")
+        return
+    _rare_cooldown[uid] = now
+    await check_rare_for_user(uid, manual=True)
 
 async def check_rare_for_user(telegram_id: int, manual: bool = False,
                                observations: list | None = None):
@@ -2196,7 +2896,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
         if observations is None:
             d1_str = (datetime.now(timezone.utc) - timedelta(hours=AUTO_CHECK_WINDOW_HOURS)).date().isoformat()
             data   = await api_get(f"{API_BASE}/observations", {
-                "lat": round(lat, 2), "lng": round(lon, 2), "radius": radius, "d1": d1_str,
+                "lat": _q_coord(lat, radius), "lng": _q_coord(lon, radius), "radius": radius, "d1": d1_str,
                 "iconic_taxa": "Aves", "locale": "ru",
                 "per_page": 100, "order_by": "observed_on", "order": "desc",
             })
@@ -2384,7 +3084,7 @@ async def check_rare_for_user(telegram_id: int, manual: bool = False,
                 if ebird_key in notified_obs_keys or neg_tid in recent_notified:
                     continue
 
-            obs_dt    = notable.get("obsDt", "")[:10]
+            obs_dt    = e(str(notable.get("obsDt") or "")[:10])
             how_many  = notable.get("howMany")
             count_str = f" · {how_many} особ." if how_many else ""
             loc_name  = notable.get("locName", "")
@@ -2774,10 +3474,14 @@ async def scheduled_checks():
 async def inline_search(inline_query: InlineQuery):
     query = inline_query.query.strip()
     if len(query) < 2:
+        # Bot API 6.7+: switch_pm_* заменены кнопкой InlineQueryResultsButton.
+        # start_parameter: 1-64 символа, только A-Z, a-z, 0-9, _ и -.
         await inline_query.answer(
             [], cache_time=5,
-            switch_pm_text="Введите название птицы...",
-            switch_pm_parameter="start",
+            button=InlineQueryResultsButton(
+                text="Введите название птицы...",
+                start_parameter="start",
+            ),
         )
         return
 
@@ -2840,7 +3544,8 @@ async def inline_search(inline_query: InlineQuery):
             ),
         ))
 
-    await inline_query.answer(results, cache_time=60)
+    # В результатах есть расстояние от пользователя: такие ответы нельзя отдавать другим пользователям из кэша Telegram.
+    await inline_query.answer(results, cache_time=60, is_personal=bool(nearest_obs))
 
 # ================= ЗАПУСК =================
 async def main():
@@ -2873,6 +3578,36 @@ async def main():
         logger.info("eBird API ключ найден — хотспоты и notable birds активны")
     else:
         logger.info("EBIRD_API_KEY не задан — eBird-функции отключены")
+
+    # Авторизация iNaturalist нужна только для определения птицы по фото.
+    if INAT_USERNAME and INAT_APP_ID:
+        try:
+            if await get_inat_jwt():
+                logger.info("iNat CV: JWT получен ✅")
+            else:
+                logger.error("iNat CV: НЕ удалось получить JWT ❌")
+        except Exception as ex:
+            logger.error(f"iNat CV: НЕ удалось получить JWT ❌ ({type(ex).__name__}: {ex})")
+    else:
+        logger.warning("iNat CV: аутентификация не настроена, определение по фото работать не будет.")
+
+    try:
+        import aiogram as _aiogram
+        _aiogram_ver = getattr(_aiogram, "__version__", "?")
+    except Exception:
+        _aiogram_ver = "?"
+    logger.info(
+        f"BAM {BOT_VERSION} · aiogram {_aiogram_ver} · "
+        f"Rich Messages: {'вкл' if RICH_MESSAGES_ENABLED else 'выкл'} · "
+        f"Widgets: {'вкл' if WIDGETS_ENABLED else 'выкл'}"
+    )
+    if (InputRichMessage is None or WidgetQuery is None) and (
+        _env_flag("BAM_RICH_MESSAGES", True) or _env_flag("BAM_WIDGETS", True)
+    ):
+        logger.warning(
+            "Rich Messages / Widgets недоступны: установите aiogram>=3.32 (Bot API 10.4). "
+            "Остальные функции бота работают без них."
+        )
 
     # Восстановление незавершённых уведомлений после перезапуска
     try:
